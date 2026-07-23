@@ -111,6 +111,7 @@ struct DotStrokeApp {
     rounding: String,
     zoom: f32,
     pan: Vec2,
+    viewport_size: Vec2,
     pending: Vec<[f32; 2]>,
     current_layer: usize,
     status: String,
@@ -128,6 +129,7 @@ impl Default for DotStrokeApp {
             rounding: "nearest".into(),
             zoom: 2.0,
             pan: Vec2::ZERO,
+            viewport_size: Vec2::new(800.0, 600.0),
             pending: vec![],
             current_layer: 0,
             status: "Ready".into(),
@@ -164,6 +166,10 @@ impl DotStrokeApp {
             rect.left() + self.pan.x + p[0] * self.zoom,
             rect.top() + self.pan.y + p[1] * self.zoom,
         )
+    }
+
+    fn max_zoom(&self) -> f32 {
+        (self.viewport_size.x.min(self.viewport_size.y) / 8.0).max(0.25)
     }
 
     fn commit_pending(&mut self, closed: bool) {
@@ -240,6 +246,9 @@ impl DotStrokeApp {
 
     fn draw_canvas(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
+        self.viewport_size = size;
+        let max_zoom = self.max_zoom();
+        self.zoom = self.zoom.min(max_zoom);
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::WHITE);
@@ -252,27 +261,49 @@ impl DotStrokeApp {
             Stroke::new(1.0, Color32::DARK_GRAY),
             egui::StrokeKind::Outside,
         );
-        let grid = Color32::from_gray(235);
-        let step = 20.0 * self.zoom;
-        if step >= 4.0 {
-            for x in (0..=self.doc.target.width).step_by(20) {
+        let grid_step: i32 = if self.zoom >= 4.0 {
+            1
+        } else if self.zoom >= 2.0 {
+            5
+        } else {
+            20
+        };
+        let grid_spacing = grid_step as f32 * self.zoom;
+        if grid_spacing >= 4.0 {
+            for x in (0..=self.doc.target.width).step_by(grid_step as usize) {
                 let sx = canvas_rect.left() + x as f32 * self.zoom;
+                let is_major = x % 20 == 0;
                 painter.line_segment(
                     [
                         Pos2::new(sx, canvas_rect.top()),
                         Pos2::new(sx, canvas_rect.bottom()),
                     ],
-                    Stroke::new(1.0, grid),
+                    Stroke::new(
+                        if is_major { 1.0 } else { 0.5 },
+                        if is_major {
+                            Color32::from_gray(205)
+                        } else {
+                            Color32::from_gray(232)
+                        },
+                    ),
                 );
             }
-            for y in (0..=self.doc.target.height).step_by(20) {
+            for y in (0..=self.doc.target.height).step_by(grid_step as usize) {
                 let sy = canvas_rect.top() + y as f32 * self.zoom;
+                let is_major = y % 20 == 0;
                 painter.line_segment(
                     [
                         Pos2::new(canvas_rect.left(), sy),
                         Pos2::new(canvas_rect.right(), sy),
                     ],
-                    Stroke::new(1.0, grid),
+                    Stroke::new(
+                        if is_major { 1.0 } else { 0.5 },
+                        if is_major {
+                            Color32::from_gray(205)
+                        } else {
+                            Color32::from_gray(232)
+                        },
+                    ),
                 );
             }
         }
@@ -299,13 +330,16 @@ impl DotStrokeApp {
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.0 {
-                self.zoom = (self.zoom * (1.0 + scroll.signum() * 0.1)).clamp(0.25, 8.0);
+                self.zoom = (self.zoom * (1.0 + scroll.signum() * 0.1)).clamp(0.25, max_zoom);
             }
         }
-        if response.dragged_by(egui::PointerButton::Middle) {
-            self.pan += response.drag_delta();
+        let space_down = ui.input(|i| i.key_down(egui::Key::Space));
+        if (space_down && response.dragged_by(egui::PointerButton::Primary))
+            || response.dragged_by(egui::PointerButton::Middle)
+        {
+            self.pan += ui.input(|i| i.pointer.delta());
         }
-        if response.clicked() {
+        if response.clicked() && !space_down {
             if let Some(pos) = response.interact_pointer_pos() {
                 let p = self.snap(self.screen_to_doc(rect, pos));
                 match self.tool.as_str() {
@@ -419,7 +453,7 @@ impl eframe::App for DotStrokeApp {
                     self.zoom = (self.zoom - 0.25).max(0.25);
                 }
                 if ui.button("+").clicked() {
-                    self.zoom = (self.zoom + 0.25).min(8.0);
+                    self.zoom = (self.zoom + 0.25).min(self.max_zoom());
                 }
                 if ui.button("Reset").clicked() {
                     self.zoom = 2.0;
@@ -472,6 +506,7 @@ impl eframe::App for DotStrokeApp {
             }
             ui.separator();
             ui.label(&self.status);
+            ui.label("Space + left-drag: pan");
             ui.label("Middle-drag: pan");
             ui.label("Wheel: zoom");
             ui.label("Right-click/Enter: finalize");
