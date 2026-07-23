@@ -562,6 +562,11 @@ class DotStrokeApp:
 		self.editor_scale = EDITOR_SCALE
 		self.canvas_width = CANVAS_WIDTH
 		self.canvas_height = CANVAS_HEIGHT
+		# Keep the editor viewport stable.  The canvas content may become larger
+		# or smaller when zooming, but the surrounding window must not follow its
+		# requested size.
+		self.editor_viewport_width = self.canvas_width * self.editor_scale
+		self.editor_viewport_height = self.canvas_height * self.editor_scale
 		self.undo_stack: List[Dict[str, Any]] = []
 		self.redo_stack: List[Dict[str, Any]] = []
 		self.status_text = tk.StringVar(value="Ready")
@@ -731,22 +736,15 @@ class DotStrokeApp:
 		tk.Button(action_btns, text="Copy Lua", command=self.copy_lua_to_clipboard).pack(side=tk.LEFT, padx=(4, 0))
 		tk.Button(action_btns, text="Copy JSON", command=self.copy_json_to_clipboard).pack(side=tk.LEFT, padx=(4, 0))
 
-		self.editor_canvas = tk.Canvas(
+		self.editor_viewport = ttk.Frame(
 			center,
-			width=self.canvas_width * self.editor_scale,
-			height=self.canvas_height * self.editor_scale,
-			bg="white",
-			highlightthickness=1,
-			highlightbackground="#333",
+			width=self.editor_viewport_width,
+			height=self.editor_viewport_height,
 		)
+		self.editor_viewport.pack_propagate(False)
+		self.editor_viewport.pack(anchor=tk.NW)
+		self.editor_canvas = self._create_editor_canvas()
 		self.editor_canvas.pack(fill=tk.BOTH, expand=True)
-		self.editor_canvas.bind("<Button-1>", self.on_canvas_left_click)
-		self.editor_canvas.bind("<ButtonRelease-1>", self.on_canvas_left_release)
-		self.editor_canvas.bind("<Button-3>", self.on_canvas_right_click)
-		self.editor_canvas.bind("<Motion>", self.on_canvas_motion)
-		self.editor_canvas.bind("<MouseWheel>", self.on_canvas_wheel)
-		self.editor_canvas.bind("<Button-4>", lambda _event: self.adjust_editor_zoom(1))
-		self.editor_canvas.bind("<Button-5>", lambda _event: self.adjust_editor_zoom(-1))
 		self.root.bind("<Return>", self.on_finalize_key)
 		self.root.bind("<Escape>", self.on_cancel_key)
 		self.root.bind("<Control-z>", lambda _event: self.undo())
@@ -760,6 +758,24 @@ class DotStrokeApp:
 		ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 		ttk.Label(right, text="Status").pack(anchor=tk.W)
 		ttk.Label(right, textvariable=self.status_text, wraplength=360, justify=tk.LEFT).pack(anchor=tk.W)
+
+	def _create_editor_canvas(self) -> tk.Canvas:
+		canvas = tk.Canvas(
+			self.editor_viewport,
+			width=self.editor_viewport_width,
+			height=self.editor_viewport_height,
+			bg="white",
+			highlightthickness=1,
+			highlightbackground="#333",
+		)
+		canvas.bind("<Button-1>", self.on_canvas_left_click)
+		canvas.bind("<ButtonRelease-1>", self.on_canvas_left_release)
+		canvas.bind("<Button-3>", self.on_canvas_right_click)
+		canvas.bind("<Motion>", self.on_canvas_motion)
+		canvas.bind("<MouseWheel>", self.on_canvas_wheel)
+		canvas.bind("<Button-4>", lambda _event: self.adjust_editor_zoom(1))
+		canvas.bind("<Button-5>", lambda _event: self.adjust_editor_zoom(-1))
+		return canvas
 
 	def get_layers(self) -> List[Layer]:
 		return [Layer.from_dict(layer) for layer in self.doc.get("layers", [])]
@@ -814,10 +830,6 @@ class DotStrokeApp:
 		self.dither_anchor_var.set(self.doc.get("canvas", {}).get("ditherAnchor", "screen"))
 		self.rasterizer = Rasterizer(self.canvas_width, self.canvas_height)
 		self.preview_image = tk.PhotoImage(width=self.canvas_width, height=self.canvas_height)
-		self.editor_canvas.configure(
-			width=max(1, int(self.canvas_width * self.editor_scale)),
-			height=max(1, int(self.canvas_height * self.editor_scale)),
-		)
 		self.refresh_layer_list()
 		self.refresh_object_list()
 		self.redraw_all()
@@ -1015,12 +1027,19 @@ class DotStrokeApp:
 			self.set_status("Endpoint moved")
 
 	def adjust_editor_zoom(self, direction: int) -> None:
+		old_scale = self.editor_scale
 		self.editor_scale = max(1, min(8, self.editor_scale + direction))
-		self.editor_canvas.configure(
-			width=max(1, int(self.canvas_width * self.editor_scale)),
-			height=max(1, int(self.canvas_height * self.editor_scale)),
-		)
-		self.redraw_all()
+		if self.editor_scale == old_scale:
+			return
+
+		# Zoom the existing items in place.  Rebuilding and swapping canvases
+		# here can still expose a blank frame on some Tk/macOS combinations,
+		# especially for very small documents such as 32x32.
+		ratio = self.editor_scale / old_scale
+		self.editor_canvas.scale("all", 0, 0, ratio, ratio)
+		for item in self.editor_canvas.find_withtag("editor-object"):
+			width = float(self.editor_canvas.itemcget(item, "width") or 1)
+			self.editor_canvas.itemconfigure(item, width=max(1, round(width * ratio)))
 		self.set_status(f"Editor zoom: {self.editor_scale}x")
 
 	def on_canvas_wheel(self, event: tk.Event) -> None:
@@ -1245,19 +1264,30 @@ class DotStrokeApp:
 		return segments
 
 	def redraw_all(self) -> None:
+		self._redraw_editor()
+		self._render_preview()
+
+	def _redraw_editor(self) -> None:
+		# Zooming uses in-place item scaling, so this full redraw is only used
+		# when the document itself changes.
 		self.editor_canvas.delete("all")
 		self._draw_editor_grid()
 		self._draw_editor_objects()
 		self._draw_pending_shape()
-		self._render_preview()
 
 	def _draw_editor_grid(self) -> None:
 		for x in range(0, self.canvas_width + 1, 20):
 			sx = x * self.editor_scale
-			self.editor_canvas.create_line(sx, 0, sx, self.canvas_height * self.editor_scale, fill="#efefef")
+			self.editor_canvas.create_line(
+				sx, 0, sx, self.canvas_height * self.editor_scale,
+				fill="#efefef", tags=("editor-grid",),
+			)
 		for y in range(0, self.canvas_height + 1, 20):
 			sy = y * self.editor_scale
-			self.editor_canvas.create_line(0, sy, self.canvas_width * self.editor_scale, sy, fill="#efefef")
+			self.editor_canvas.create_line(
+				0, sy, self.canvas_width * self.editor_scale, sy,
+				fill="#efefef", tags=("editor-grid",),
+			)
 
 	def _draw_editor_objects(self) -> None:
 		segments = self._build_segments(optimize=False, output_type=self.output_type_var.get())
@@ -1281,6 +1311,7 @@ class DotStrokeApp:
 				y2 * self.editor_scale,
 				fill=draw_color,
 				width=max(1, int(style.get("width", 1)) * self.editor_scale),
+				tags=("editor-object",),
 			)
 		obj = self._selected_object()
 		if obj and obj.points:
@@ -1296,6 +1327,7 @@ class DotStrokeApp:
 					y * self.editor_scale + radius,
 					outline="#ff0066",
 					width=1,
+					tags=("editor-handle",),
 				)
 
 	def _draw_pending_shape(self) -> None:
@@ -1304,12 +1336,15 @@ class DotStrokeApp:
 		pts = [(p[0] * self.editor_scale, p[1] * self.editor_scale) for p in self.current_points]
 		if len(pts) == 1:
 			x, y = pts[0]
-			self.editor_canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#333", outline="")
+			self.editor_canvas.create_oval(
+				x - 2, y - 2, x + 2, y + 2,
+				fill="#333", outline="", tags=("editor-pending",),
+			)
 			return
 		flat: List[float] = []
 		for p in pts:
 			flat.extend([p[0], p[1]])
-		self.editor_canvas.create_line(*flat, fill="#f06", dash=(3, 2))
+		self.editor_canvas.create_line(*flat, fill="#f06", dash=(3, 2), tags=("editor-pending",))
 
 	def _render_preview(self) -> None:
 		self.rasterizer.clear()
