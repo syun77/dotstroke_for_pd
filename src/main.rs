@@ -2,8 +2,8 @@ use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-const DEFAULT_WIDTH: i32 = 400;
-const DEFAULT_HEIGHT: i32 = 240;
+const DEFAULT_WIDTH: i32 = 32;
+const DEFAULT_HEIGHT: i32 = 32;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -117,6 +117,7 @@ struct DotStrokeApp {
     current_layer: usize,
     status: String,
     undo: Vec<Document>,
+    redo: Vec<Document>,
 }
 
 impl Default for DotStrokeApp {
@@ -136,6 +137,7 @@ impl Default for DotStrokeApp {
             current_layer: 0,
             status: "Ready".into(),
             undo: vec![],
+            redo: vec![],
         }
     }
 }
@@ -143,8 +145,35 @@ impl Default for DotStrokeApp {
 impl DotStrokeApp {
     fn save_history(&mut self) {
         self.undo.push(self.doc.clone());
+        self.redo.clear();
         if self.undo.len() > 100 {
             self.undo.remove(0);
+        }
+    }
+
+    fn undo_document(&mut self) {
+        if let Some(previous) = self.undo.pop() {
+            self.redo.push(self.doc.clone());
+            self.doc = previous;
+            self.pending.clear();
+            self.selected = None;
+            self.current_layer = self
+                .current_layer
+                .min(self.doc.layers.len().saturating_sub(1));
+            self.status = "Undo".into();
+        }
+    }
+
+    fn redo_document(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.doc.clone());
+            self.doc = next;
+            self.pending.clear();
+            self.selected = None;
+            self.current_layer = self
+                .current_layer
+                .min(self.doc.layers.len().saturating_sub(1));
+            self.status = "Redo".into();
         }
     }
 
@@ -538,6 +567,19 @@ impl DotStrokeApp {
 
 impl eframe::App for DotStrokeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let (undo_pressed, redo_pressed) = ui.input(|input| {
+            let modifier = input.modifiers.ctrl || input.modifiers.command;
+            (
+                modifier && input.key_pressed(egui::Key::Z),
+                modifier && input.key_pressed(egui::Key::Y),
+            )
+        });
+        if undo_pressed {
+            self.undo_document();
+        }
+        if redo_pressed {
+            self.redo_document();
+        }
         egui::Panel::left("tools").resizable(false).show(ui, |ui| {
             ui.heading("DotStroke");
             ui.label("Tool");
@@ -559,10 +601,12 @@ impl eframe::App for DotStrokeApp {
                     self.doc.target.width, self.doc.target.height
                 ));
                 if ui.button("32x32").clicked() {
+                    self.save_history();
                     self.doc.target.width = 32;
                     self.doc.target.height = 32;
                 }
                 if ui.button("400x240").clicked() {
+                    self.save_history();
                     self.doc.target.width = 400;
                     self.doc.target.height = 240;
                 }
@@ -605,6 +649,14 @@ impl eframe::App for DotStrokeApp {
             if ui.button("Cancel").clicked() {
                 self.pending.clear();
             }
+            ui.horizontal(|ui| {
+                if ui.button("Undo").clicked() {
+                    self.undo_document();
+                }
+                if ui.button("Redo").clicked() {
+                    self.redo_document();
+                }
+            });
             ui.separator();
             ui.label("Vectors");
             let vector_names: Vec<String> = self.doc.layers[self.current_layer]
