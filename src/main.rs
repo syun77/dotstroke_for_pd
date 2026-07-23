@@ -313,7 +313,12 @@ impl DotStrokeApp {
         let pts: Vec<Pos2> = object
             .points
             .iter()
-            .map(|p| Pos2::new(rect.left() + pan.x + p[0] * zoom, rect.top() + pan.y + p[1] * zoom))
+            .map(|p| {
+                Pos2::new(
+                    rect.left() + pan.x + p[0] * zoom,
+                    rect.top() + pan.y + p[1] * zoom,
+                )
+            })
             .collect();
         let color = match object.style.color.as_str() {
             "white" => Color32::GRAY,
@@ -513,7 +518,7 @@ impl DotStrokeApp {
             self.doc.target.height as f32 * scale,
         );
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-        let painter = ui.painter_at(rect);
+        let painter = ui.painter_at(rect).with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::WHITE);
         for layer in &self.doc.layers {
             if layer.visible {
