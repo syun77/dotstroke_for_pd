@@ -1,0 +1,1 @@
+# dotstroke_for_pd
