@@ -2,6 +2,7 @@
 
 import json
 import math
+import copy
 import tkinter as tk
 from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox, ttk
@@ -97,6 +98,26 @@ def apply_transform(point: Point, transform: Dict[str, Any]) -> Point:
 		a, b, c, d, e, f = matrix
 		return (a * point[0] + b * point[1] + c, d * point[0] + e * point[1] + f)
 	return transform_point(point, transform)
+
+
+def inverse_transform_point(point: Point, transform: Dict[str, Any]) -> Point:
+	if transform.get("_matrix"):
+		a, b, c, d, e, f = transform["_matrix"]
+		determinant = a * e - b * d
+		if abs(determinant) < 1e-12:
+			return point
+		x, y = point[0] - c, point[1] - f
+		return ((e * x - b * y) / determinant, (-d * x + a * y) / determinant)
+	tx = float(transform.get("x", 0.0))
+	ty = float(transform.get("y", 0.0))
+	sx = float(transform.get("scaleX", 1.0))
+	sy = float(transform.get("scaleY", 1.0))
+	px, py = [float(v) for v in transform.get("pivot", [0.0, 0.0])]
+	x, y = point[0] - tx - px, point[1] - ty - py
+	r = math.radians(float(transform.get("rotation", 0.0)))
+	cos_r, sin_r = math.cos(r), math.sin(r)
+	rx, ry = x * cos_r + y * sin_r, -x * sin_r + y * cos_r
+	return (rx / sx + px if sx else px, ry / sy + py if sy else py)
 
 
 def style_key(style: Dict[str, Any]) -> Tuple[Any, ...]:
@@ -256,9 +277,11 @@ def line_bbox(seg: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
 	return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
 
 
-def bbox_outside_screen(bbox: Tuple[int, int, int, int]) -> bool:
+def bbox_outside_screen(
+	bbox: Tuple[float, float, float, float], width: int = CANVAS_WIDTH, height: int = CANVAS_HEIGHT
+) -> bool:
 	x0, y0, x1, y1 = bbox
-	return x1 < 0 or y1 < 0 or x0 >= CANVAS_WIDTH or y0 >= CANVAS_HEIGHT
+	return x1 < 0 or y1 < 0 or x0 >= width or y0 >= height
 
 
 @dataclass
@@ -269,6 +292,7 @@ class VectorObject:
 	style: Dict[str, Any] = field(default_factory=dict)
 	transform: Dict[str, Any] = field(default_factory=dict)
 	children: List["VectorObject"] = field(default_factory=list)
+	visible: bool = True
 
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -277,6 +301,7 @@ class VectorObject:
 			"closed": self.closed,
 			"style": self.style,
 			"transform": self.transform,
+			"visible": self.visible,
 			**({"children": [child.to_dict() for child in self.children]} if self.children else {}),
 		}
 
@@ -290,6 +315,7 @@ class VectorObject:
 			style=copy_style(data.get("style", {})),
 			transform=data.get("transform", {}),
 			children=[VectorObject.from_dict(child) for child in data.get("children", [])],
+			visible=bool(data.get("visible", True)),
 		)
 
 
@@ -338,8 +364,8 @@ def normalize_document(raw: Dict[str, Any]) -> Dict[str, Any]:
 	if raw.get("format") != "pdvector":
 		raise ValueError("Unsupported format")
 	target = {**new_document()["target"], **raw.get("target", {})}
-	if int(target.get("width", 0)) != CANVAS_WIDTH or int(target.get("height", 0)) != CANVAS_HEIGHT:
-		raise ValueError("Only a 400x240 Playdate canvas is supported")
+	if int(target.get("width", 0)) <= 0 or int(target.get("height", 0)) <= 0:
+		raise ValueError("Canvas width and height must be positive")
 	if target.get("rounding", "nearest") not in {"floor", "ceil", "nearest", "subpixel"}:
 		raise ValueError("Unsupported rounding mode")
 	canvas = {**new_document()["canvas"], **raw.get("canvas", {})}
@@ -367,14 +393,14 @@ def normalize_document(raw: Dict[str, Any]) -> Dict[str, Any]:
 	return doc
 
 
-def new_document() -> Dict[str, Any]:
+def new_document(width: int = CANVAS_WIDTH, height: int = CANVAS_HEIGHT) -> Dict[str, Any]:
 	return {
 		"format": "pdvector",
 		"version": 1,
 		"target": {
 			"sdk": "3.1.1",
-			"width": CANVAS_WIDTH,
-			"height": CANVAS_HEIGHT,
+			"width": int(width),
+			"height": int(height),
 			"coordinateSystem": "top-left",
 			"pixelSnap": "integer",
 			"rounding": "nearest",
@@ -529,7 +555,15 @@ class DotStrokeApp:
 		self.root.title("DotStroke for Playdate")
 		self.doc = new_document()
 		self.current_layer_index = 0
+		self.selected_object_index: Optional[int] = None
 		self.current_points: List[Point] = []
+		self.drag_endpoint: Optional[int] = None
+		self.drag_history_started = False
+		self.editor_scale = EDITOR_SCALE
+		self.canvas_width = CANVAS_WIDTH
+		self.canvas_height = CANVAS_HEIGHT
+		self.undo_stack: List[Dict[str, Any]] = []
+		self.redo_stack: List[Dict[str, Any]] = []
 		self.status_text = tk.StringVar(value="Ready")
 
 		self.tool_var = tk.StringVar(value="line")
@@ -545,10 +579,13 @@ class DotStrokeApp:
 		self.dither_level_var = tk.DoubleVar(value=1.0)
 		self.dither_anchor_var = tk.StringVar(value="screen")
 		self.layer_visible_var = tk.BooleanVar(value=True)
+		self.mode_edit_var = tk.StringVar(value="stroke")
+		self.resolution_width_var = tk.IntVar(value=CANVAS_WIDTH)
+		self.resolution_height_var = tk.IntVar(value=CANVAS_HEIGHT)
 
-		self.rasterizer = Rasterizer(CANVAS_WIDTH, CANVAS_HEIGHT)
-		self.preview_image = tk.PhotoImage(width=CANVAS_WIDTH, height=CANVAS_HEIGHT)
-		self.preview_zoom = 2
+		self.rasterizer = Rasterizer(self.canvas_width, self.canvas_height)
+		self.preview_image = tk.PhotoImage(width=self.canvas_width, height=self.canvas_height)
+		self.preview_zoom = 1
 
 		self._build_ui()
 		self.refresh_layer_list()
@@ -573,6 +610,19 @@ class DotStrokeApp:
 			state="readonly",
 			width=14,
 		).pack(anchor=tk.W, pady=(0, 8))
+		tk.Label(left, text="Edit mode").pack(anchor=tk.W)
+		mode_buttons = ttk.Frame(left)
+		mode_buttons.pack(anchor=tk.W, pady=(0, 8))
+		tk.Radiobutton(mode_buttons, text="Stroke", variable=self.mode_edit_var, value="stroke", command=lambda: self.set_edit_mode("stroke")).pack(side=tk.LEFT)
+		tk.Radiobutton(mode_buttons, text="Move", variable=self.mode_edit_var, value="move", command=lambda: self.set_edit_mode("move")).pack(side=tk.LEFT)
+
+		tk.Label(left, text="Resolution").pack(anchor=tk.W)
+		resolution = ttk.Frame(left)
+		resolution.pack(anchor=tk.W, pady=(0, 8))
+		tk.Spinbox(resolution, from_=1, to=4096, textvariable=self.resolution_width_var, width=6).pack(side=tk.LEFT)
+		tk.Label(resolution, text=" x ").pack(side=tk.LEFT)
+		tk.Spinbox(resolution, from_=1, to=4096, textvariable=self.resolution_height_var, width=6).pack(side=tk.LEFT)
+		tk.Button(resolution, text="Apply", command=self.apply_resolution).pack(side=tk.LEFT, padx=(4, 0))
 
 		ttk.Label(left, text="Style").pack(anchor=tk.W)
 		ttk.Combobox(
@@ -639,7 +689,17 @@ class DotStrokeApp:
 		ttk.Button(layer_btns, text="Add", command=self.add_layer).pack(side=tk.LEFT)
 		ttk.Button(layer_btns, text="Delete", command=self.delete_layer).pack(side=tk.LEFT, padx=(4, 0))
 
-		ttk.Label(left, text="Export").pack(anchor=tk.W)
+		ttk.Label(left, text="Vectors").pack(anchor=tk.W)
+		self.object_list = tk.Listbox(left, height=8, width=24, exportselection=False)
+		self.object_list.pack(anchor=tk.W)
+		self.object_list.bind("<<ListboxSelect>>", self.on_object_select)
+		object_btns = ttk.Frame(left)
+		object_btns.pack(anchor=tk.W, pady=(4, 8))
+		tk.Button(object_btns, text="Show/Hide", command=self.toggle_selected_object).pack(side=tk.LEFT)
+		tk.Button(object_btns, text="Duplicate", command=self.duplicate_selected_object).pack(side=tk.LEFT, padx=(4, 0))
+		tk.Button(object_btns, text="Delete", command=self.delete_selected_object).pack(side=tk.LEFT, padx=(4, 0))
+
+		tk.Label(left, text="Export").pack(anchor=tk.W)
 		ttk.Combobox(
 			left,
 			textvariable=self.mode_var,
@@ -663,26 +723,39 @@ class DotStrokeApp:
 
 		action_btns = ttk.Frame(left)
 		action_btns.pack(anchor=tk.W)
+		tk.Button(action_btns, text="Undo", command=self.undo).pack(side=tk.LEFT)
+		tk.Button(action_btns, text="Redo", command=self.redo).pack(side=tk.LEFT, padx=(4, 0))
 		ttk.Button(action_btns, text="Export Lua", command=self.on_export_lua).pack(side=tk.LEFT)
 		ttk.Button(action_btns, text="Optimize", command=self.on_optimize_preview).pack(side=tk.LEFT, padx=(4, 0))
 
+		tk.Button(action_btns, text="Copy Lua", command=self.copy_lua_to_clipboard).pack(side=tk.LEFT, padx=(4, 0))
+		tk.Button(action_btns, text="Copy JSON", command=self.copy_json_to_clipboard).pack(side=tk.LEFT, padx=(4, 0))
+
 		self.editor_canvas = tk.Canvas(
 			center,
-			width=CANVAS_WIDTH * EDITOR_SCALE,
-			height=CANVAS_HEIGHT * EDITOR_SCALE,
+			width=self.canvas_width * self.editor_scale,
+			height=self.canvas_height * self.editor_scale,
 			bg="white",
 			highlightthickness=1,
 			highlightbackground="#333",
 		)
 		self.editor_canvas.pack(fill=tk.BOTH, expand=True)
 		self.editor_canvas.bind("<Button-1>", self.on_canvas_left_click)
+		self.editor_canvas.bind("<ButtonRelease-1>", self.on_canvas_left_release)
 		self.editor_canvas.bind("<Button-3>", self.on_canvas_right_click)
 		self.editor_canvas.bind("<Motion>", self.on_canvas_motion)
+		self.editor_canvas.bind("<MouseWheel>", self.on_canvas_wheel)
+		self.editor_canvas.bind("<Button-4>", lambda _event: self.adjust_editor_zoom(1))
+		self.editor_canvas.bind("<Button-5>", lambda _event: self.adjust_editor_zoom(-1))
 		self.root.bind("<Return>", self.on_finalize_key)
 		self.root.bind("<Escape>", self.on_cancel_key)
+		self.root.bind("<Control-z>", lambda _event: self.undo())
+		self.root.bind("<Control-y>", lambda _event: self.redo())
+		self.root.bind("<Command-z>", lambda _event: self.undo())
+		self.root.bind("<Command-y>", lambda _event: self.redo())
 
 		ttk.Label(right, text="1-bit Preview").pack(anchor=tk.W)
-		self.preview_label = ttk.Label(right, image=self.preview_image.zoom(self.preview_zoom, self.preview_zoom))
+		self.preview_label = ttk.Label(right, image=self.preview_image)
 		self.preview_label.pack(anchor=tk.NW)
 		ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 		ttk.Label(right, text="Status").pack(anchor=tk.W)
@@ -702,6 +775,81 @@ class DotStrokeApp:
 	def set_status(self, text: str) -> None:
 		self.status_text.set(text)
 
+	def _canvas_size(self) -> Tuple[int, int]:
+		return (
+			int(getattr(self, "canvas_width", self.doc.get("target", {}).get("width", CANVAS_WIDTH))),
+			int(getattr(self, "canvas_height", self.doc.get("target", {}).get("height", CANVAS_HEIGHT))),
+		)
+
+	def _record_history(self) -> None:
+		self.undo_stack.append(copy.deepcopy(self.doc))
+		self.redo_stack.clear()
+		if len(self.undo_stack) > 100:
+			self.undo_stack.pop(0)
+
+	def undo(self) -> None:
+		if not self.undo_stack:
+			self.set_status("Nothing to undo.")
+			return
+		self.redo_stack.append(copy.deepcopy(self.doc))
+		self.doc = self.undo_stack.pop()
+		self._sync_document_view()
+		self.set_status("Undo")
+
+	def redo(self) -> None:
+		if not self.redo_stack:
+			self.set_status("Nothing to redo.")
+			return
+		self.undo_stack.append(copy.deepcopy(self.doc))
+		self.doc = self.redo_stack.pop()
+		self._sync_document_view()
+		self.set_status("Redo")
+
+	def _sync_document_view(self) -> None:
+		self.canvas_width = int(self.doc.get("target", {}).get("width", CANVAS_WIDTH))
+		self.canvas_height = int(self.doc.get("target", {}).get("height", CANVAS_HEIGHT))
+		self.resolution_width_var.set(self.canvas_width)
+		self.resolution_height_var.set(self.canvas_height)
+		self.rounding_var.set(self.doc.get("target", {}).get("rounding", "nearest"))
+		self.dither_anchor_var.set(self.doc.get("canvas", {}).get("ditherAnchor", "screen"))
+		self.rasterizer = Rasterizer(self.canvas_width, self.canvas_height)
+		self.preview_image = tk.PhotoImage(width=self.canvas_width, height=self.canvas_height)
+		self.editor_canvas.configure(
+			width=max(1, int(self.canvas_width * self.editor_scale)),
+			height=max(1, int(self.canvas_height * self.editor_scale)),
+		)
+		self.refresh_layer_list()
+		self.refresh_object_list()
+		self.redraw_all()
+
+	def apply_resolution(self) -> None:
+		width = max(1, int(self.resolution_width_var.get()))
+		height = max(1, int(self.resolution_height_var.get()))
+		if (width, height) == (self.canvas_width, self.canvas_height):
+			return
+		self._record_history()
+		self.doc.setdefault("target", {})["width"] = width
+		self.doc["target"]["height"] = height
+		self._sync_document_view()
+		self.set_status(f"Resolution: {width} x {height}")
+
+	def _selected_object(self) -> Optional[VectorObject]:
+		if self.selected_object_index is None:
+			return None
+		layers = self.get_layers()
+		if not layers or not (0 <= self.current_layer_index < len(layers)):
+			return None
+		objects = layers[self.current_layer_index].objects
+		if not (0 <= self.selected_object_index < len(objects)):
+			return None
+		return objects[self.selected_object_index]
+
+	def set_edit_mode(self, mode: str) -> None:
+		self.mode_edit_var.set(mode)
+		self.current_points.clear()
+		self.drag_endpoint = None
+		self.set_status("Stroke mode" if mode == "stroke" else "Move mode")
+
 	def refresh_layer_list(self) -> None:
 		layers = self.get_layers()
 		self.layer_list.delete(0, tk.END)
@@ -714,13 +862,64 @@ class DotStrokeApp:
 			self.layer_list.selection_set(self.current_layer_index)
 			self.layer_visible_var.set(layers[self.current_layer_index].visible)
 
+	def refresh_object_list(self) -> None:
+		if not hasattr(self, "object_list"):
+			return
+		self.object_list.delete(0, tk.END)
+		layers = self.get_layers()
+		if not layers:
+			return
+		for index, obj in enumerate(layers[self.current_layer_index].objects):
+			marker = "[x]" if obj.visible else "[ ]"
+			self.object_list.insert(tk.END, f"{marker} {index + 1}: {obj.type}")
+		if self.selected_object_index is not None and self.selected_object_index < len(layers[self.current_layer_index].objects):
+			self.object_list.selection_set(self.selected_object_index)
+
+	def on_object_select(self, _event: Any) -> None:
+		sel = self.object_list.curselection()
+		self.selected_object_index = sel[0] if sel else None
+		self.redraw_all()
+
+	def _mutate_selected_object(self, action: str) -> None:
+		if self.selected_object_index is None:
+			return
+		layers = self.get_layers()
+		objects = layers[self.current_layer_index].objects
+		if not (0 <= self.selected_object_index < len(objects)):
+			return
+		self._record_history()
+		obj = objects[self.selected_object_index]
+		if action == "toggle":
+			obj.visible = not obj.visible
+		elif action == "delete":
+			del objects[self.selected_object_index]
+			self.selected_object_index = min(self.selected_object_index, len(objects) - 1) if objects else None
+		elif action == "duplicate":
+			objects.insert(self.selected_object_index + 1, copy.deepcopy(obj))
+			self.selected_object_index += 1
+		self.set_layers(layers)
+		self.refresh_object_list()
+		self.redraw_all()
+
+	def toggle_selected_object(self) -> None:
+		self._mutate_selected_object("toggle")
+
+	def delete_selected_object(self) -> None:
+		self._mutate_selected_object("delete")
+
+	def duplicate_selected_object(self) -> None:
+		self._mutate_selected_object("duplicate")
+
 	def add_layer(self) -> None:
+		self._record_history()
 		layers = self.get_layers()
 		new_id = f"layer{len(layers) + 1}"
 		layers.append(Layer(id=new_id, visible=True, objects=[]))
 		self.set_layers(layers)
 		self.current_layer_index = len(layers) - 1
 		self.refresh_layer_list()
+		self.selected_object_index = None
+		self.refresh_object_list()
 		self.redraw_all()
 
 	def delete_layer(self) -> None:
@@ -728,10 +927,13 @@ class DotStrokeApp:
 		if len(layers) <= 1:
 			messagebox.showinfo("DotStroke", "At least one layer is required.")
 			return
+		self._record_history()
 		del layers[self.current_layer_index]
 		self.set_layers(layers)
 		self.current_layer_index = clamp(self.current_layer_index, 0, len(layers) - 1)
 		self.refresh_layer_list()
+		self.selected_object_index = None
+		self.refresh_object_list()
 		self.redraw_all()
 
 	def on_layer_select(self, _event: Any) -> None:
@@ -739,21 +941,25 @@ class DotStrokeApp:
 		if not sel:
 			return
 		self.current_layer_index = sel[0]
+		self.selected_object_index = None
 		layers = self.get_layers()
 		self.layer_visible_var.set(layers[self.current_layer_index].visible)
+		self.refresh_object_list()
 		self.redraw_all()
 
 	def on_layer_visible_toggle(self) -> None:
 		layers = self.get_layers()
 		if not layers:
 			return
+		self._record_history()
 		layers[self.current_layer_index].visible = bool(self.layer_visible_var.get())
 		self.set_layers(layers)
 		self.refresh_layer_list()
+		self.refresh_object_list()
 		self.redraw_all()
 
 	def _editor_to_doc_point(self, event: tk.Event) -> Point:
-		return (event.x / EDITOR_SCALE, event.y / EDITOR_SCALE)
+		return (event.x / self.editor_scale, event.y / self.editor_scale)
 
 	def _active_style(self) -> Dict[str, Any]:
 		style = default_style()
@@ -775,6 +981,20 @@ class DotStrokeApp:
 	def on_canvas_left_click(self, event: tk.Event) -> None:
 		p = self._editor_to_doc_point(event)
 		rounded = snap_point(p, self.rounding_var.get())
+		if self.mode_edit_var.get() == "move":
+			obj = self._selected_object()
+			if obj and obj.points:
+				candidates = [0] if len(obj.points) == 1 else [0, len(obj.points) - 1]
+				display_points = self._object_to_poly_points(obj.points, obj.transform)
+				endpoint = min(candidates, key=lambda i: math.hypot(display_points[i][0] - p[0], display_points[i][1] - p[1]))
+				if math.hypot(display_points[endpoint][0] - p[0], display_points[endpoint][1] - p[1]) <= max(6.0, 8.0 / self.editor_scale):
+					self._record_history()
+					self.drag_endpoint = endpoint
+					self.drag_history_started = True
+					self.set_status("Dragging vector endpoint")
+				return
+			self.set_status("Select a vector and grab its endpoint in Move mode.")
+			return
 		tool = self.tool_var.get()
 
 		if tool == "pixel":
@@ -787,6 +1007,24 @@ class DotStrokeApp:
 		elif tool in ("polyline", "polygon", "rect", "ellipse", "bezier", "path"):
 			self.current_points.append(rounded)
 		self.redraw_all()
+
+	def on_canvas_left_release(self, _event: tk.Event) -> None:
+		if self.drag_endpoint is not None:
+			self.drag_endpoint = None
+			self.drag_history_started = False
+			self.set_status("Endpoint moved")
+
+	def adjust_editor_zoom(self, direction: int) -> None:
+		self.editor_scale = max(1, min(8, self.editor_scale + direction))
+		self.editor_canvas.configure(
+			width=max(1, int(self.canvas_width * self.editor_scale)),
+			height=max(1, int(self.canvas_height * self.editor_scale)),
+		)
+		self.redraw_all()
+		self.set_status(f"Editor zoom: {self.editor_scale}x")
+
+	def on_canvas_wheel(self, event: tk.Event) -> None:
+		self.adjust_editor_zoom(1 if event.delta > 0 else -1)
 
 	def on_canvas_right_click(self, _event: tk.Event) -> None:
 		self.finalize_current_shape()
@@ -801,8 +1039,16 @@ class DotStrokeApp:
 
 	def on_canvas_motion(self, event: tk.Event) -> None:
 		p = self._editor_to_doc_point(event)
-		px = int(clamp(round(p[0]), 0, CANVAS_WIDTH - 1))
-		py = int(clamp(round(p[1]), 0, CANVAS_HEIGHT - 1))
+		if self.drag_endpoint is not None and self.mode_edit_var.get() == "move":
+			layers = self.get_layers()
+			if layers and self.selected_object_index is not None:
+				obj = layers[self.current_layer_index].objects[self.selected_object_index]
+				if obj.points:
+					obj.points[self.drag_endpoint] = inverse_transform_point(snap_point(p, self.rounding_var.get()), obj.transform)
+					self.set_layers(layers)
+					self.redraw_all()
+		px = int(clamp(round(p[0]), 0, self.canvas_width - 1))
+		py = int(clamp(round(p[1]), 0, self.canvas_height - 1))
 		self.set_status(
 			f"Cursor: ({px}, {py}) | Tool: {self.tool_var.get()} | Pending points: {len(self.current_points)}"
 		)
@@ -839,6 +1085,7 @@ class DotStrokeApp:
 		if obj_type == "polygon" and len(points) < 3:
 			self.set_status("Polygon ignored: at least 3 points required.")
 			return
+		self._record_history()
 
 		obj = VectorObject(
 			type=obj_type,
@@ -857,8 +1104,10 @@ class DotStrokeApp:
 		layer.objects.append(obj)
 		layers[self.current_layer_index] = layer
 		self.set_layers(layers)
+		self.selected_object_index = len(layer.objects) - 1
 		self.set_status(f"Added {obj_type} with {len(points)} points.")
 		self.refresh_layer_list()
+		self.refresh_object_list()
 
 	def _object_to_poly_points(
 		self,
@@ -916,6 +1165,7 @@ class DotStrokeApp:
 
 	def _build_commands(self, output_type: str) -> List[Dict[str, Any]]:
 		commands: List[Dict[str, Any]] = []
+		canvas_width, canvas_height = self._canvas_size()
 
 		def visit(obj: VectorObject, parent_transform: Optional[Dict[str, Any]] = None) -> None:
 			parent_transform = parent_transform or {}
@@ -929,11 +1179,12 @@ class DotStrokeApp:
 			style = self._style_for_object(obj, points)
 			if obj.type == "group":
 				for child in obj.children:
-					visit(child, obj.transform if not parent_transform else compose_transforms(parent_transform, obj.transform))
+					if child.visible:
+						visit(child, obj.transform if not parent_transform else compose_transforms(parent_transform, obj.transform))
 				return
 			if points and self.doc.get("target", {}).get("clip", True):
 				bbox = (min(p[0] for p in points), min(p[1] for p in points), max(p[0] for p in points), max(p[1] for p in points))
-				if bbox_outside_screen(bbox):
+				if bbox_outside_screen(bbox, canvas_width, canvas_height):
 					return
 			if obj.type == "pixel" and points:
 				commands.append({"kind": "pixel", "points": [points[0]], "style": style})
@@ -951,7 +1202,8 @@ class DotStrokeApp:
 		for layer in self.get_layers():
 			if layer.visible:
 				for obj in layer.objects:
-					visit(obj)
+					if obj.visible:
+						visit(obj)
 		return commands
 
 	def _build_segments(
@@ -961,6 +1213,7 @@ class DotStrokeApp:
 		rasterize: bool = True,
 	) -> List[Segment]:
 		segments: List[Segment] = []
+		canvas_width, canvas_height = self._canvas_size()
 		for command in self._build_commands(output_type):
 			kind = command["kind"]
 			raw_pts: List[Point] = command["points"]
@@ -976,7 +1229,7 @@ class DotStrokeApp:
 				segments.append((p[0], p[1], p[0], p[1], st))
 				continue
 			if command.get("fill") and len(raster_pts) >= 3:
-				for x0, x1, y in polygon_scanlines(raster_pts):
+				for x0, x1, y in polygon_scanlines(raster_pts, canvas_width, canvas_height):
 					segments.append((x0, y, x1, y, st))
 			for i in range(len(pts) - 1):
 				segments.append((pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], st))
@@ -984,7 +1237,7 @@ class DotStrokeApp:
 				segments.append((pts[-1][0], pts[-1][1], pts[0][0], pts[0][1], st))
 
 		if self.doc.get("target", {}).get("clip", True):
-			segments = [seg for seg in segments if not bbox_outside_screen(line_bbox(seg[:4]))]
+			segments = [seg for seg in segments if not bbox_outside_screen(line_bbox(seg[:4]), canvas_width, canvas_height)]
 
 		if optimize and self.doc.get("optimize", {}).get("mergeCollinearLines", True):
 			segments = merge_collinear_segments(segments)
@@ -999,12 +1252,12 @@ class DotStrokeApp:
 		self._render_preview()
 
 	def _draw_editor_grid(self) -> None:
-		for x in range(0, CANVAS_WIDTH + 1, 20):
-			sx = x * EDITOR_SCALE
-			self.editor_canvas.create_line(sx, 0, sx, CANVAS_HEIGHT * EDITOR_SCALE, fill="#efefef")
-		for y in range(0, CANVAS_HEIGHT + 1, 20):
-			sy = y * EDITOR_SCALE
-			self.editor_canvas.create_line(0, sy, CANVAS_WIDTH * EDITOR_SCALE, sy, fill="#efefef")
+		for x in range(0, self.canvas_width + 1, 20):
+			sx = x * self.editor_scale
+			self.editor_canvas.create_line(sx, 0, sx, self.canvas_height * self.editor_scale, fill="#efefef")
+		for y in range(0, self.canvas_height + 1, 20):
+			sy = y * self.editor_scale
+			self.editor_canvas.create_line(0, sy, self.canvas_width * self.editor_scale, sy, fill="#efefef")
 
 	def _draw_editor_objects(self) -> None:
 		segments = self._build_segments(optimize=False, output_type=self.output_type_var.get())
@@ -1022,18 +1275,33 @@ class DotStrokeApp:
 			else:
 				draw_color = "black"
 			self.editor_canvas.create_line(
-				x1 * EDITOR_SCALE,
-				y1 * EDITOR_SCALE,
-				x2 * EDITOR_SCALE,
-				y2 * EDITOR_SCALE,
+				x1 * self.editor_scale,
+				y1 * self.editor_scale,
+				x2 * self.editor_scale,
+				y2 * self.editor_scale,
 				fill=draw_color,
-				width=max(1, int(style.get("width", 1)) * EDITOR_SCALE),
+				width=max(1, int(style.get("width", 1)) * self.editor_scale),
 			)
+		obj = self._selected_object()
+		if obj and obj.points:
+			handle_points = self._object_to_poly_points(obj.points, obj.transform)
+			indices = [0] if len(handle_points) == 1 else [0, len(handle_points) - 1]
+			for index in indices:
+				x, y = handle_points[index]
+				radius = max(3, self.editor_scale * 2)
+				self.editor_canvas.create_oval(
+					x * self.editor_scale - radius,
+					y * self.editor_scale - radius,
+					x * self.editor_scale + radius,
+					y * self.editor_scale + radius,
+					outline="#ff0066",
+					width=1,
+				)
 
 	def _draw_pending_shape(self) -> None:
 		if not self.current_points:
 			return
-		pts = [(p[0] * EDITOR_SCALE, p[1] * EDITOR_SCALE) for p in self.current_points]
+		pts = [(p[0] * self.editor_scale, p[1] * self.editor_scale) for p in self.current_points]
 		if len(pts) == 1:
 			x, y = pts[0]
 			self.editor_canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#333", outline="")
@@ -1050,25 +1318,26 @@ class DotStrokeApp:
 
 		# Tk PhotoImage.put expects rows of explicit color tokens, not run-length tuples.
 		rows: List[str] = []
-		for y in range(CANVAS_HEIGHT):
-			row_colors = ["#000000" if self.rasterizer.pixels[y][x] else "#ffffff" for x in range(CANVAS_WIDTH)]
+		for y in range(self.canvas_height):
+			row_colors = ["#000000" if self.rasterizer.pixels[y][x] else "#ffffff" for x in range(self.canvas_width)]
 			rows.append("{" + " ".join(row_colors) + "}")
-		self.preview_image.put(" ".join(rows), to=(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT))
+		self.preview_image.put(" ".join(rows), to=(0, 0, self.canvas_width, self.canvas_height))
 		zoomed = self.preview_image.zoom(self.preview_zoom, self.preview_zoom)
 		self.preview_label.configure(image=zoomed)
 		self.preview_label.image = zoomed
 
 	def on_new(self) -> None:
 		if messagebox.askyesno("DotStroke", "Create a new document?"):
+			self._record_history()
 			self.doc = new_document()
 			self.current_layer_index = 0
+			self.selected_object_index = None
 			self.current_points.clear()
 			self.rounding_var.set("nearest")
 			self.dither_anchor_var.set("screen")
 			self.dither_type_var.set("none")
 			self.dither_level_var.set(1.0)
-			self.refresh_layer_list()
-			self.redraw_all()
+			self._sync_document_view()
 			self.set_status("New document created.")
 
 	def on_save_json(self) -> None:
@@ -1095,15 +1364,17 @@ class DotStrokeApp:
 		try:
 			with open(path, "r", encoding="utf-8") as f:
 				doc = json.load(f)
-			self.doc = normalize_document(doc)
+				normalized = normalize_document(doc)
+				self._record_history()
+				self.doc = normalized
 			self.current_layer_index = 0
+			self.selected_object_index = None
 			self.rounding_var.set(self.doc.get("target", {}).get("rounding", "nearest"))
 			self.dither_anchor_var.set(self.doc.get("canvas", {}).get("ditherAnchor", "screen"))
 			self.dither_type_var.set("none")
 			self.dither_level_var.set(1.0)
 			self.current_points.clear()
-			self.refresh_layer_list()
-			self.redraw_all()
+			self._sync_document_view()
 			self.set_status(f"Loaded JSON: {path}")
 		except Exception as exc:
 			messagebox.showerror("DotStroke", f"Failed to load JSON: {exc}")
@@ -1361,6 +1632,21 @@ class DotStrokeApp:
 		text.pack(fill=tk.BOTH, expand=True)
 		text.insert("1.0", lua_code)
 		text.configure(state=tk.DISABLED)
+
+	def copy_lua_to_clipboard(self) -> None:
+		lua_code = self._generate_lua()
+		self.root.clipboard_clear()
+		self.root.clipboard_append(lua_code)
+		self.root.update()
+		self.set_status("Lua output copied to clipboard.")
+
+	def copy_json_to_clipboard(self) -> None:
+		self.doc["target"]["rounding"] = self.rounding_var.get()
+		self.doc.setdefault("canvas", {})["ditherAnchor"] = self.dither_anchor_var.get()
+		self.root.clipboard_clear()
+		self.root.clipboard_append(json.dumps(self.doc, indent=2, ensure_ascii=False))
+		self.root.update()
+		self.set_status("JSON output copied to clipboard.")
 
 
 def main() -> None:
