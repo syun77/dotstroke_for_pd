@@ -113,6 +113,7 @@ struct DotStrokeApp {
     pan: Vec2,
     viewport_size: Vec2,
     pending: Vec<[f32; 2]>,
+    selected: Option<(usize, usize)>,
     current_layer: usize,
     status: String,
     undo: Vec<Document>,
@@ -131,6 +132,7 @@ impl Default for DotStrokeApp {
             pan: Vec2::ZERO,
             viewport_size: Vec2::new(800.0, 600.0),
             pending: vec![],
+            selected: None,
             current_layer: 0,
             status: "Ready".into(),
             undo: vec![],
@@ -172,6 +174,101 @@ impl DotStrokeApp {
         (self.viewport_size.x.min(self.viewport_size.y) / 8.0).max(0.25)
     }
 
+    fn hit_test(&self, rect: Rect, pos: Pos2) -> Option<usize> {
+        let p = self.screen_to_doc(rect, pos);
+        let tolerance = 8.0 / self.zoom;
+        self.doc
+            .layers
+            .get(self.current_layer)?
+            .objects
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, object)| {
+                if !object.visible || object.points.is_empty() {
+                    return None;
+                }
+                let min_x = object
+                    .points
+                    .iter()
+                    .map(|p| p[0])
+                    .fold(f32::INFINITY, f32::min)
+                    - tolerance;
+                let max_x = object
+                    .points
+                    .iter()
+                    .map(|p| p[0])
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    + tolerance;
+                let min_y = object
+                    .points
+                    .iter()
+                    .map(|p| p[1])
+                    .fold(f32::INFINITY, f32::min)
+                    - tolerance;
+                let max_y = object
+                    .points
+                    .iter()
+                    .map(|p| p[1])
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    + tolerance;
+                (p.x >= min_x && p.x <= max_x && p.y >= min_y && p.y <= max_y).then_some(index)
+            })
+    }
+
+    fn move_selected(&mut self, delta: Vec2) {
+        if let Some((layer_index, object_index)) = self.selected {
+            if let Some(object) = self
+                .doc
+                .layers
+                .get_mut(layer_index)
+                .and_then(|l| l.objects.get_mut(object_index))
+            {
+                for point in &mut object.points {
+                    point[0] += delta.x;
+                    point[1] += delta.y;
+                }
+            }
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        if let Some((layer_index, object_index)) = self.selected.take() {
+            let can_delete = self
+                .doc
+                .layers
+                .get(layer_index)
+                .map_or(false, |layer| object_index < layer.objects.len());
+            if can_delete {
+                self.save_history();
+                self.doc.layers[layer_index].objects.remove(object_index);
+                self.status = "Vector deleted".into();
+            }
+        }
+    }
+
+    fn duplicate_selected(&mut self) {
+        if let Some((layer_index, object_index)) = self.selected {
+            let copy = self
+                .doc
+                .layers
+                .get(layer_index)
+                .and_then(|layer| layer.objects.get(object_index))
+                .cloned();
+            if let Some(mut copy) = copy {
+                self.save_history();
+                for point in &mut copy.points {
+                    point[0] += 8.0;
+                    point[1] += 8.0;
+                }
+                let new_index = object_index + 1;
+                self.doc.layers[layer_index].objects.insert(new_index, copy);
+                self.selected = Some((layer_index, new_index));
+                self.status = "Vector duplicated".into();
+            }
+        }
+    }
+
     fn commit_pending(&mut self, closed: bool) {
         let required = match self.tool.as_str() {
             "polygon" => 3,
@@ -199,25 +296,36 @@ impl DotStrokeApp {
     }
 
     fn draw_object(&self, painter: &egui::Painter, rect: Rect, object: &VectorObject) {
+        self.draw_object_at(painter, rect, object, self.zoom, self.pan);
+    }
+
+    fn draw_object_at(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        object: &VectorObject,
+        zoom: f32,
+        pan: Vec2,
+    ) {
         if !object.visible || object.points.is_empty() {
             return;
         }
         let pts: Vec<Pos2> = object
             .points
             .iter()
-            .map(|p| self.doc_to_screen(rect, *p))
+            .map(|p| Pos2::new(rect.left() + pan.x + p[0] * zoom, rect.top() + pan.y + p[1] * zoom))
             .collect();
         let color = match object.style.color.as_str() {
             "white" => Color32::GRAY,
             "clear" => Color32::from_rgb(60, 150, 255),
             _ => Color32::BLACK,
         };
-        let stroke = Stroke::new((object.style.width.max(1) as f32) * self.zoom, color);
+        let stroke = Stroke::new((object.style.width.max(1) as f32) * zoom, color);
         match object.kind.as_str() {
             "pixel" => {
                 painter.circle_filled(
                     pts[0],
-                    (object.style.width.max(1) as f32 * self.zoom).max(1.0),
+                    (object.style.width.max(1) as f32 * zoom).max(1.0),
                     color,
                 );
             }
@@ -250,7 +358,7 @@ impl DotStrokeApp {
         let max_zoom = self.max_zoom();
         self.zoom = self.zoom.min(max_zoom);
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
+        let painter = ui.painter_at(rect).with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::WHITE);
         let w = self.doc.target.width as f32 * self.zoom;
         let h = self.doc.target.height as f32 * self.zoom;
@@ -309,8 +417,19 @@ impl DotStrokeApp {
         }
         for layer in &self.doc.layers {
             if layer.visible {
-                for object in &layer.objects {
+                for (index, object) in layer.objects.iter().enumerate() {
                     self.draw_object(&painter, rect, object);
+                    if self.selected == Some((self.current_layer, index))
+                        && !object.points.is_empty()
+                    {
+                        for point in &object.points {
+                            painter.circle_stroke(
+                                self.doc_to_screen(rect, *point),
+                                4.0,
+                                Stroke::new(1.5, Color32::from_rgb(255, 0, 100)),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -339,7 +458,21 @@ impl DotStrokeApp {
         {
             self.pan += ui.input(|i| i.pointer.delta());
         }
-        if response.clicked() && !space_down {
+        if self.tool == "select" && !space_down && response.dragged_by(egui::PointerButton::Primary)
+        {
+            if self.selected.is_some() {
+                if response.drag_started() {
+                    self.save_history();
+                }
+                let delta = ui.input(|i| i.pointer.delta()) / self.zoom;
+                self.move_selected(delta);
+            }
+        } else if self.tool == "select" && !space_down && response.clicked() {
+            self.selected = response
+                .interact_pointer_pos()
+                .and_then(|pos| self.hit_test(rect, pos))
+                .map(|index| (self.current_layer, index));
+        } else if response.clicked() && !space_down {
             if let Some(pos) = response.interact_pointer_pos() {
                 let p = self.snap(self.screen_to_doc(rect, pos));
                 match self.tool.as_str() {
@@ -385,7 +518,7 @@ impl DotStrokeApp {
         for layer in &self.doc.layers {
             if layer.visible {
                 for object in &layer.objects {
-                    self.draw_object(&painter, rect, object);
+                    self.draw_object_at(&painter, rect, object, 1.0, Vec2::ZERO);
                 }
             }
         }
@@ -407,7 +540,8 @@ impl eframe::App for DotStrokeApp {
                 .selected_text(&self.tool)
                 .show_ui(ui, |ui| {
                     for tool in [
-                        "pixel", "line", "polyline", "polygon", "rect", "ellipse", "bezier", "path",
+                        "select", "pixel", "line", "polyline", "polygon", "rect", "ellipse",
+                        "bezier", "path",
                     ] {
                         ui.selectable_value(&mut self.tool, tool.into(), tool);
                     }
@@ -466,6 +600,29 @@ impl eframe::App for DotStrokeApp {
             if ui.button("Cancel").clicked() {
                 self.pending.clear();
             }
+            ui.separator();
+            ui.label("Vectors");
+            let vector_names: Vec<String> = self.doc.layers[self.current_layer]
+                .objects
+                .iter()
+                .enumerate()
+                .map(|(index, object)| format!("{}: {}", index + 1, object.kind))
+                .collect();
+            for (index, name) in vector_names.iter().enumerate() {
+                let is_selected = self.selected == Some((self.current_layer, index));
+                if ui.selectable_label(is_selected, name).clicked() {
+                    self.selected = Some((self.current_layer, index));
+                    self.tool = "select".into();
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Delete").clicked() {
+                    self.delete_selected();
+                }
+                if ui.button("Duplicate").clicked() {
+                    self.duplicate_selected();
+                }
+            });
             ui.separator();
             if ui.button("New").clicked() {
                 self.save_history();
