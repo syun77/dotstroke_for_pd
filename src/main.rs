@@ -1,9 +1,12 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::{fmt::Write as _, fs};
 
 const DEFAULT_WIDTH: i32 = 32;
 const DEFAULT_HEIGHT: i32 = 32;
+const CONTROL_POINT_RADIUS: f32 = 4.0;
+const CONTROL_POINT_HOVER_RADIUS: f32 = 7.0;
+const CONTROL_POINT_HIT_RADIUS: f32 = 24.0;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -13,6 +16,7 @@ struct Style {
     width: i32,
     cap: String,
     fill: bool,
+    radius: i32,
 }
 
 impl Default for Style {
@@ -23,6 +27,7 @@ impl Default for Style {
             width: 1,
             cap: "butt".into(),
             fill: false,
+            radius: 4,
         }
     }
 }
@@ -108,12 +113,14 @@ struct DotStrokeApp {
     color: String,
     width: i32,
     fill: bool,
+    radius: i32,
     rounding: String,
     zoom: f32,
     pan: Vec2,
     viewport_size: Vec2,
     pending: Vec<[f32; 2]>,
     selected: Option<(usize, usize)>,
+    selected_point: Option<usize>,
     current_layer: usize,
     status: String,
     undo: Vec<Document>,
@@ -128,12 +135,14 @@ impl Default for DotStrokeApp {
             color: "black".into(),
             width: 1,
             fill: false,
+            radius: 4,
             rounding: "nearest".into(),
             zoom: 2.0,
             pan: Vec2::ZERO,
             viewport_size: Vec2::new(800.0, 600.0),
             pending: vec![],
             selected: None,
+            selected_point: None,
             current_layer: 0,
             status: "Ready".into(),
             undo: vec![],
@@ -157,6 +166,7 @@ impl DotStrokeApp {
             self.doc = previous;
             self.pending.clear();
             self.selected = None;
+            self.selected_point = None;
             self.current_layer = self
                 .current_layer
                 .min(self.doc.layers.len().saturating_sub(1));
@@ -170,6 +180,7 @@ impl DotStrokeApp {
             self.doc = next;
             self.pending.clear();
             self.selected = None;
+            self.selected_point = None;
             self.current_layer = self
                 .current_layer
                 .min(self.doc.layers.len().saturating_sub(1));
@@ -245,6 +256,29 @@ impl DotStrokeApp {
             })
     }
 
+    fn hit_test_control_point(&self, rect: Rect, pos: Pos2) -> Option<usize> {
+        let (layer_index, object_index) = self.selected?;
+        let object = self
+            .doc
+            .layers
+            .get(layer_index)?
+            .objects
+            .get(object_index)?;
+        let hit_radius = CONTROL_POINT_HIT_RADIUS;
+        object
+            .points
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let screen_point = self.doc_to_screen(rect, *point);
+                let distance = screen_point.distance_sq(pos);
+                (index, distance)
+            })
+            .filter(|(_, distance)| *distance <= hit_radius * hit_radius)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(index, _)| index)
+    }
+
     fn move_selected(&mut self, delta: Vec2) {
         if let Some((layer_index, object_index)) = self.selected {
             if let Some(object) = self
@@ -261,6 +295,21 @@ impl DotStrokeApp {
         }
     }
 
+    fn move_selected_point(&mut self, point_index: usize, delta: Vec2) {
+        if let Some((layer_index, object_index)) = self.selected {
+            if let Some(point) = self
+                .doc
+                .layers
+                .get_mut(layer_index)
+                .and_then(|layer| layer.objects.get_mut(object_index))
+                .and_then(|object| object.points.get_mut(point_index))
+            {
+                point[0] += delta.x;
+                point[1] += delta.y;
+            }
+        }
+    }
+
     fn delete_selected(&mut self) {
         if let Some((layer_index, object_index)) = self.selected.take() {
             let can_delete = self
@@ -271,6 +320,7 @@ impl DotStrokeApp {
             if can_delete {
                 self.save_history();
                 self.doc.layers[layer_index].objects.remove(object_index);
+                self.selected_point = None;
                 self.status = "Vector deleted".into();
             }
         }
@@ -293,6 +343,7 @@ impl DotStrokeApp {
                 let new_index = object_index + 1;
                 self.doc.layers[layer_index].objects.insert(new_index, copy);
                 self.selected = Some((layer_index, new_index));
+                self.selected_point = None;
                 self.status = "Vector duplicated".into();
             }
         }
@@ -316,12 +367,187 @@ impl DotStrokeApp {
                 color: self.color.clone(),
                 width: self.width,
                 fill: self.fill,
+                radius: self.radius,
                 ..Style::default()
             },
             visible: true,
             ..Default::default()
         });
         self.status = "Vector added".into();
+    }
+
+    fn lua_number(value: f32) -> String {
+        if value == 0.0 {
+            "0".into()
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn lua_color(color: &str) -> &'static str {
+        match color {
+            "white" => "gfx.kColorWhite",
+            "clear" => "gfx.kColorClear",
+            _ => "gfx.kColorBlack",
+        }
+    }
+
+    fn lua_cap_style(cap: &str) -> &'static str {
+        match cap {
+            "round" => "gfx.kLineCapStyleRound",
+            "square" => "gfx.kLineCapStyleSquare",
+            _ => "gfx.kLineCapStyleButt",
+        }
+    }
+
+    fn append_lua_object(output: &mut String, object: &VectorObject) {
+        if !object.visible || object.points.is_empty() {
+            return;
+        }
+
+        let point =
+            |p: &[f32; 2]| format!("{}, {}", Self::lua_number(p[0]), Self::lua_number(p[1]));
+        let points = |points: &[[f32; 2]]| points.iter().map(point).collect::<Vec<_>>().join(", ");
+        let _ = writeln!(
+            output,
+            "gfx.setColor({})",
+            Self::lua_color(&object.style.color)
+        );
+
+        match object.kind.as_str() {
+            "pixel" => {
+                let _ = writeln!(output, "gfx.drawPixel({})", point(&object.points[0]));
+            }
+            "rect" if object.points.len() >= 2 => {
+                let x = object.points[0][0].min(object.points[1][0]);
+                let y = object.points[0][1].min(object.points[1][1]);
+                let width = (object.points[0][0] - object.points[1][0]).abs();
+                let height = (object.points[0][1] - object.points[1][1]).abs();
+                let _ = writeln!(output, "gfx.setLineWidth({})", object.style.width.max(1));
+                if object.style.fill {
+                    let _ = writeln!(
+                        output,
+                        "gfx.fillRect({}, {}, {}, {})",
+                        Self::lua_number(x),
+                        Self::lua_number(y),
+                        Self::lua_number(width),
+                        Self::lua_number(height)
+                    );
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "gfx.drawRect({}, {}, {}, {})",
+                        Self::lua_number(x),
+                        Self::lua_number(y),
+                        Self::lua_number(width),
+                        Self::lua_number(height)
+                    );
+                }
+            }
+            "round_rect" if object.points.len() >= 2 => {
+                let x = object.points[0][0].min(object.points[1][0]);
+                let y = object.points[0][1].min(object.points[1][1]);
+                let width = (object.points[0][0] - object.points[1][0]).abs();
+                let height = (object.points[0][1] - object.points[1][1]).abs();
+                let function = if object.style.fill {
+                    "fillRoundRect"
+                } else {
+                    "drawRoundRect"
+                };
+                let _ = writeln!(output, "gfx.setLineWidth({})", object.style.width.max(1));
+                let _ = writeln!(
+                    output,
+                    "gfx.{}({}, {}, {}, {}, {})",
+                    function,
+                    Self::lua_number(x),
+                    Self::lua_number(y),
+                    Self::lua_number(width),
+                    Self::lua_number(height),
+                    object.style.radius.max(0)
+                );
+            }
+            "ellipse" if object.points.len() >= 2 => {
+                let x = object.points[0][0].min(object.points[1][0]);
+                let y = object.points[0][1].min(object.points[1][1]);
+                let width = (object.points[0][0] - object.points[1][0]).abs();
+                let height = (object.points[0][1] - object.points[1][1]).abs();
+                let _ = writeln!(output, "gfx.setLineWidth({})", object.style.width.max(1));
+                let function = if object.style.fill {
+                    "fillEllipseInRect"
+                } else {
+                    "drawEllipseInRect"
+                };
+                let _ = writeln!(
+                    output,
+                    "gfx.{}({}, {}, {}, {})",
+                    function,
+                    Self::lua_number(x),
+                    Self::lua_number(y),
+                    Self::lua_number(width),
+                    Self::lua_number(height)
+                );
+            }
+            "polygon" if object.points.len() >= 3 => {
+                let _ = writeln!(output, "gfx.setLineWidth({})", object.style.width.max(1));
+                let _ = writeln!(
+                    output,
+                    "gfx.setLineCapStyle({})",
+                    Self::lua_cap_style(&object.style.cap)
+                );
+                let args = points(&object.points);
+                if object.style.fill {
+                    let _ = writeln!(output, "gfx.fillPolygon({})", args);
+                }
+                let _ = writeln!(output, "gfx.drawPolygon({})", args);
+            }
+            "line" | "polyline" | "path" if object.points.len() >= 2 => {
+                let _ = writeln!(output, "gfx.setLineWidth({})", object.style.width.max(1));
+                let _ = writeln!(
+                    output,
+                    "gfx.setLineCapStyle({})",
+                    Self::lua_cap_style(&object.style.cap)
+                );
+                for pair in object.points.windows(2) {
+                    let _ = writeln!(
+                        output,
+                        "gfx.drawLine({}, {}, {}, {})",
+                        Self::lua_number(pair[0][0]),
+                        Self::lua_number(pair[0][1]),
+                        Self::lua_number(pair[1][0]),
+                        Self::lua_number(pair[1][1])
+                    );
+                }
+                if object.closed && object.points.len() > 2 {
+                    let first = &object.points[0];
+                    let last = object.points.last().unwrap();
+                    let _ = writeln!(
+                        output,
+                        "gfx.drawLine({}, {}, {}, {})",
+                        Self::lua_number(last[0]),
+                        Self::lua_number(last[1]),
+                        Self::lua_number(first[0]),
+                        Self::lua_number(first[1])
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        for child in &object.children {
+            Self::append_lua_object(output, child);
+        }
+    }
+
+    fn playdate_lua(&self) -> String {
+        let mut output = String::from("local gfx <const> = playdate.graphics\n");
+        for layer in &self.doc.layers {
+            if layer.visible {
+                for object in &layer.objects {
+                    Self::append_lua_object(&mut output, object);
+                }
+            }
+        }
+        output
     }
 
     fn draw_object(&self, painter: &egui::Painter, rect: Rect, object: &VectorObject) {
@@ -371,6 +597,15 @@ impl DotStrokeApp {
                     painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Middle);
                 }
             }
+            "round_rect" if pts.len() >= 2 => {
+                let r = Rect::from_two_pos(pts[0], pts[1]);
+                let radius = object.style.radius.max(0) as f32 * zoom;
+                if object.style.fill {
+                    painter.rect_filled(r, radius, color);
+                } else {
+                    painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Middle);
+                }
+            }
             "ellipse" if pts.len() >= 2 => {
                 let r = Rect::from_two_pos(pts[0], pts[1]);
                 painter.circle_stroke(r.center(), r.width().min(r.height()) / 2.0, stroke);
@@ -383,6 +618,87 @@ impl DotStrokeApp {
                     painter.line_segment([*pts.last().unwrap(), pts[0]], stroke);
                 }
             }
+        }
+    }
+
+    fn draw_tool_preview(&self, painter: &egui::Painter, rect: Rect, cursor: Pos2) {
+        if self.tool == "select" {
+            return;
+        }
+
+        let cursor = self.snap(self.screen_to_doc(rect, cursor));
+        let cursor = self.doc_to_screen(rect, cursor);
+        let preview_color = Color32::from_rgba_unmultiplied(255, 0, 100, 105);
+        let preview_fill = Color32::from_rgba_unmultiplied(255, 0, 100, 20);
+        let preview_stroke = Stroke::new(
+            (self.width.max(1) as f32 * self.zoom).max(1.0),
+            preview_color,
+        );
+
+        match self.tool.as_str() {
+            "pixel" => {
+                painter.circle_filled(
+                    cursor,
+                    (self.width.max(1) as f32 * self.zoom).max(1.0),
+                    preview_fill,
+                );
+                painter.circle_stroke(cursor, preview_stroke.width, preview_stroke);
+            }
+            "line" | "polyline" | "path" => {
+                if let Some(point) = self.pending.last() {
+                    painter
+                        .line_segment([self.doc_to_screen(rect, *point), cursor], preview_stroke);
+                } else {
+                    painter.circle_stroke(cursor, 6.0, preview_stroke);
+                }
+            }
+            "polygon" => {
+                if let Some(point) = self.pending.last() {
+                    painter
+                        .line_segment([self.doc_to_screen(rect, *point), cursor], preview_stroke);
+                    if self.pending.len() >= 2 {
+                        painter.line_segment(
+                            [cursor, self.doc_to_screen(rect, self.pending[0])],
+                            preview_stroke,
+                        );
+                    }
+                } else {
+                    painter.circle_stroke(cursor, 6.0, preview_stroke);
+                }
+            }
+            "rect" | "round_rect" | "ellipse" => {
+                if let Some(point) = self.pending.first() {
+                    let start = self.doc_to_screen(rect, *point);
+                    let bounds = Rect::from_two_pos(start, cursor);
+                    if matches!(self.tool.as_str(), "rect" | "round_rect") && self.fill {
+                        let radius = if self.tool == "round_rect" {
+                            self.radius.max(0) as f32 * self.zoom
+                        } else {
+                            0.0
+                        };
+                        painter.rect_filled(bounds, radius, preview_fill);
+                    }
+                    if self.tool == "rect" {
+                        painter.rect_stroke(bounds, 0.0, preview_stroke, egui::StrokeKind::Middle);
+                    } else if self.tool == "round_rect" {
+                        painter.rect_stroke(
+                            bounds,
+                            self.radius.max(0) as f32 * self.zoom,
+                            preview_stroke,
+                            egui::StrokeKind::Middle,
+                        );
+                    } else {
+                        painter.circle_stroke(
+                            bounds.center(),
+                            bounds.width().min(bounds.height()) / 2.0,
+                            preview_stroke,
+                        );
+                    }
+                } else {
+                    painter.circle_stroke(cursor, 6.0, preview_stroke);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -449,6 +765,13 @@ impl DotStrokeApp {
                 );
             }
         }
+        let hovered_control_point = if self.tool == "select" && response.hovered() {
+            response
+                .hover_pos()
+                .and_then(|pos| self.hit_test_control_point(rect, pos))
+        } else {
+            None
+        };
         for layer in &self.doc.layers {
             if layer.visible {
                 for (index, object) in layer.objects.iter().enumerate() {
@@ -456,11 +779,31 @@ impl DotStrokeApp {
                     if self.selected == Some((self.current_layer, index))
                         && !object.points.is_empty()
                     {
-                        for point in &object.points {
+                        for (point_index, point) in object.points.iter().enumerate() {
+                            let is_dragging_point = response
+                                .dragged_by(egui::PointerButton::Primary)
+                                && self.selected_point == Some(point_index);
+                            let is_hovered =
+                                hovered_control_point == Some(point_index) || is_dragging_point;
+                            let radius = if is_hovered {
+                                CONTROL_POINT_HOVER_RADIUS
+                            } else {
+                                CONTROL_POINT_RADIUS
+                            };
+                            if is_hovered {
+                                painter.circle_filled(
+                                    self.doc_to_screen(rect, *point),
+                                    radius,
+                                    Color32::from_rgba_unmultiplied(255, 0, 100, 70),
+                                );
+                            }
                             painter.circle_stroke(
                                 self.doc_to_screen(rect, *point),
-                                4.0,
-                                Stroke::new(1.5, Color32::from_rgb(255, 0, 100)),
+                                radius,
+                                Stroke::new(
+                                    if is_hovered { 2.5 } else { 1.5 },
+                                    Color32::from_rgb(255, 0, 100),
+                                ),
                             );
                         }
                     }
@@ -480,6 +823,24 @@ impl DotStrokeApp {
                 );
             }
         }
+        if !self.pending.is_empty() {
+            let guide_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 0, 100, 150));
+            for (index, point) in self.pending.iter().enumerate() {
+                let screen_point = self.doc_to_screen(rect, *point);
+                let radius = if index == 0 { 7.0 } else { 5.0 };
+                painter.circle_filled(
+                    screen_point,
+                    radius,
+                    Color32::from_rgba_unmultiplied(255, 0, 100, 25),
+                );
+                painter.circle_stroke(screen_point, radius, guide_stroke);
+            }
+        }
+        if response.hovered() {
+            if let Some(cursor) = response.hover_pos() {
+                self.draw_tool_preview(&painter, rect, cursor);
+            }
+        }
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.0 {
@@ -487,6 +848,17 @@ impl DotStrokeApp {
             }
         }
         let space_down = ui.input(|i| i.key_down(egui::Key::Space));
+        if space_down && response.hovered() {
+            let is_panning = response.dragged_by(egui::PointerButton::Primary)
+                || response.dragged_by(egui::PointerButton::Middle);
+            ui.output_mut(|output| {
+                output.cursor_icon = if is_panning {
+                    egui::CursorIcon::Grabbing
+                } else {
+                    egui::CursorIcon::Grab
+                };
+            });
+        }
         if (space_down && response.dragged_by(egui::PointerButton::Primary))
             || response.dragged_by(egui::PointerButton::Middle)
         {
@@ -496,16 +868,24 @@ impl DotStrokeApp {
         {
             if self.selected.is_some() {
                 if response.drag_started() {
+                    // The expanded hover state is the source of truth for which
+                    // control point is movable; do not use a separate drag hit test.
+                    self.selected_point = hovered_control_point;
                     self.save_history();
                 }
                 let delta = ui.input(|i| i.pointer.delta()) / self.zoom;
-                self.move_selected(delta);
+                if let Some(point_index) = self.selected_point {
+                    self.move_selected_point(point_index, delta);
+                } else {
+                    self.move_selected(delta);
+                }
             }
         } else if self.tool == "select" && !space_down && response.clicked() {
             self.selected = response
                 .interact_pointer_pos()
                 .and_then(|pos| self.hit_test(rect, pos))
                 .map(|index| (self.current_layer, index));
+            self.selected_point = None;
         } else if response.clicked() && !space_down {
             if let Some(pos) = response.interact_pointer_pos() {
                 let p = self.snap(self.screen_to_doc(rect, pos));
@@ -523,9 +903,9 @@ impl DotStrokeApp {
                     "polygon" => {
                         self.pending.push(p);
                     }
-                    "polyline" | "path" | "rect" | "ellipse" => {
+                    "polyline" | "path" | "rect" | "round_rect" | "ellipse" => {
                         self.pending.push(p);
-                        if matches!(self.tool.as_str(), "rect" | "ellipse")
+                        if matches!(self.tool.as_str(), "rect" | "round_rect" | "ellipse")
                             && self.pending.len() == 2
                         {
                             self.commit_pending(false);
@@ -587,8 +967,15 @@ impl eframe::App for DotStrokeApp {
                 .selected_text(&self.tool)
                 .show_ui(ui, |ui| {
                     for tool in [
-                        "select", "pixel", "line", "polyline", "polygon", "rect", "ellipse",
-                        "bezier", "path",
+                        "select",
+                        "pixel",
+                        "line",
+                        "polyline",
+                        "polygon",
+                        "rect",
+                        "round_rect",
+                        "ellipse",
+                        "path",
                     ] {
                         ui.selectable_value(&mut self.tool, tool.into(), tool);
                     }
@@ -622,6 +1009,9 @@ impl eframe::App for DotStrokeApp {
                 });
             ui.add(egui::Slider::new(&mut self.width, 1..=8).text("Width"));
             ui.checkbox(&mut self.fill, "Fill closed shape");
+            if self.tool == "round_rect" {
+                ui.add(egui::Slider::new(&mut self.radius, 0..=16).text("Corner radius"));
+            }
             egui::ComboBox::from_id_salt("rounding")
                 .selected_text(&self.rounding)
                 .show_ui(ui, |ui| {
@@ -669,6 +1059,7 @@ impl eframe::App for DotStrokeApp {
                 let is_selected = self.selected == Some((self.current_layer, index));
                 if ui.selectable_label(is_selected, name).clicked() {
                     self.selected = Some((self.current_layer, index));
+                    self.selected_point = None;
                     self.tool = "select".into();
                 }
             }
@@ -718,12 +1109,19 @@ impl eframe::App for DotStrokeApp {
                     }
                 }
             }
+            if ui.button("Copy Playdate Lua").clicked() {
+                ui.ctx().copy_text(self.playdate_lua());
+                self.status = "Copied Playdate Lua".into();
+            }
             ui.separator();
             ui.label(&self.status);
             ui.label("Space + left-drag: pan");
             ui.label("Middle-drag: pan");
             ui.label("Wheel: zoom");
             ui.label("Right-click/Enter: finalize");
+            if self.tool == "select" {
+                ui.label("Hover control point: drag");
+            }
         });
         egui::Panel::right("preview")
             .resizable(false)
