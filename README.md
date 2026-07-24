@@ -11,3 +11,5 @@ cargo run
 ズームはマウスホイールまたは左パネルのボタン、パンは中央ボタンのドラッグです。既存の `pdvector` JSONを読み込み、編集結果をJSONとして保存できます。
 
 旧Tkinter版は比較用として `dotstroke.py` に残しています。
+
+Style の Dither pattern から Playdate SDK のディザパターンを指定できます。選択ツールで既存ベクターを選択している場合は、そのベクターのパターンを変更します。Lua 出力では `gfx.setDitherPattern(0.5, gfx.image.kDitherType...)` として出力されます。

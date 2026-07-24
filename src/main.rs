@@ -7,6 +7,19 @@ const DEFAULT_HEIGHT: i32 = 32;
 const CONTROL_POINT_RADIUS: f32 = 4.0;
 const CONTROL_POINT_HOVER_RADIUS: f32 = 7.0;
 const CONTROL_POINT_HIT_RADIUS: f32 = 24.0;
+const DITHER_PATTERNS: [&str; 11] = [
+    "none",
+    "diagonal_line",
+    "vertical_line",
+    "horizontal_line",
+    "screen",
+    "bayer_2x2",
+    "bayer_4x4",
+    "bayer_8x8",
+    "floyd_steinberg",
+    "burkes",
+    "atkinson",
+];
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,6 +30,7 @@ struct Style {
     cap: String,
     fill: bool,
     radius: i32,
+    dither_pattern: String,
 }
 
 impl Default for Style {
@@ -28,6 +42,7 @@ impl Default for Style {
             cap: "butt".into(),
             fill: false,
             radius: 4,
+            dither_pattern: "none".into(),
         }
     }
 }
@@ -114,11 +129,13 @@ struct DotStrokeApp {
     width: i32,
     fill: bool,
     radius: i32,
+    dither_pattern: String,
     rounding: String,
     pixel_preview: bool,
     zoom: f32,
     pan: Vec2,
     viewport_size: Vec2,
+    last_fitted_target: Option<(i32, i32)>,
     pending: Vec<[f32; 2]>,
     selected: Option<(usize, usize)>,
     selected_point: Option<usize>,
@@ -126,6 +143,9 @@ struct DotStrokeApp {
     status: String,
     undo: Vec<Document>,
     redo: Vec<Document>,
+    new_dialog: bool,
+    new_width: String,
+    new_height: String,
 }
 
 impl Default for DotStrokeApp {
@@ -137,11 +157,13 @@ impl Default for DotStrokeApp {
             width: 1,
             fill: false,
             radius: 4,
+            dither_pattern: "none".into(),
             rounding: "nearest".into(),
             pixel_preview: false,
             zoom: 2.0,
             pan: Vec2::ZERO,
             viewport_size: Vec2::new(800.0, 600.0),
+            last_fitted_target: None,
             pending: vec![],
             selected: None,
             selected_point: None,
@@ -149,6 +171,9 @@ impl Default for DotStrokeApp {
             status: "Ready".into(),
             undo: vec![],
             redo: vec![],
+            new_dialog: false,
+            new_width: DEFAULT_WIDTH.to_string(),
+            new_height: DEFAULT_HEIGHT.to_string(),
         }
     }
 }
@@ -214,6 +239,19 @@ impl DotStrokeApp {
 
     fn max_zoom(&self) -> f32 {
         (self.viewport_size.x.min(self.viewport_size.y) / 8.0).max(0.25)
+    }
+
+    fn fit_canvas_to_viewport(&mut self) {
+        let width = self.doc.target.width.max(1) as f32;
+        let height = self.doc.target.height.max(1) as f32;
+        let fit_zoom = (self.viewport_size.x / width)
+            .min(self.viewport_size.y / height)
+            .max(0.01);
+        let canvas_size = Vec2::new(width * fit_zoom, height * fit_zoom);
+
+        self.zoom = fit_zoom;
+        self.pan = (self.viewport_size - canvas_size) / 2.0;
+        self.last_fitted_target = Some((self.doc.target.width, self.doc.target.height));
     }
 
     fn hit_test(&self, rect: Rect, pos: Pos2) -> Option<usize> {
@@ -370,6 +408,7 @@ impl DotStrokeApp {
                 width: self.width,
                 fill: self.fill,
                 radius: self.radius,
+                dither_pattern: self.dither_pattern.clone(),
                 ..Style::default()
             },
             visible: true,
@@ -402,6 +441,22 @@ impl DotStrokeApp {
         }
     }
 
+    fn lua_dither_pattern(pattern: &str) -> Option<&'static str> {
+        match pattern {
+            "diagonal_line" => Some("gfx.image.kDitherTypeDiagonalLine"),
+            "vertical_line" => Some("gfx.image.kDitherTypeVerticalLine"),
+            "horizontal_line" => Some("gfx.image.kDitherTypeHorizontalLine"),
+            "screen" => Some("gfx.image.kDitherTypeScreen"),
+            "bayer_2x2" => Some("gfx.image.kDitherTypeBayer2x2"),
+            "bayer_4x4" => Some("gfx.image.kDitherTypeBayer4x4"),
+            "bayer_8x8" => Some("gfx.image.kDitherTypeBayer8x8"),
+            "floyd_steinberg" => Some("gfx.image.kDitherTypeFloydSteinberg"),
+            "burkes" => Some("gfx.image.kDitherTypeBurkes"),
+            "atkinson" => Some("gfx.image.kDitherTypeAtkinson"),
+            _ => None,
+        }
+    }
+
     fn append_lua_object(output: &mut String, object: &VectorObject) {
         if !object.visible || object.points.is_empty() {
             return;
@@ -415,6 +470,9 @@ impl DotStrokeApp {
             "gfx.setColor({})",
             Self::lua_color(&object.style.color)
         );
+        if let Some(pattern) = Self::lua_dither_pattern(&object.style.dither_pattern) {
+            let _ = writeln!(output, "gfx.setDitherPattern(0.5, {})", pattern);
+        }
 
         match object.kind.as_str() {
             "pixel" => {
@@ -702,6 +760,123 @@ impl DotStrokeApp {
             }
             _ => {}
         }
+    }
+
+    fn tool_icon(ui: &mut egui::Ui, tool: &str, selected: bool) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+        let painter = ui.painter_at(rect);
+        let visuals = ui.style().interact_selectable(&response, selected);
+        painter.rect(
+            rect,
+            4.0,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Outside,
+        );
+
+        let center = rect.center();
+        let icon_stroke = Stroke::new(1.8, visuals.fg_stroke.color);
+        let left = rect.left() + 8.0;
+        let right = rect.right() - 8.0;
+        let top = rect.top() + 8.0;
+        let bottom = rect.bottom() - 8.0;
+        match tool {
+            "select" => {
+                painter.line_segment(
+                    [
+                        Pos2::new(left + 2.0, top),
+                        Pos2::new(left + 2.0, bottom - 2.0),
+                    ],
+                    icon_stroke,
+                );
+                painter.line_segment(
+                    [
+                        Pos2::new(left + 2.0, top),
+                        Pos2::new(right - 1.0, bottom - 2.0),
+                    ],
+                    icon_stroke,
+                );
+                painter.line_segment(
+                    [
+                        Pos2::new(left + 2.0, top),
+                        Pos2::new(right - 1.0, top + 2.0),
+                    ],
+                    icon_stroke,
+                );
+            }
+            "pixel" => {
+                painter.circle_filled(center, 4.0, visuals.fg_stroke.color);
+            }
+            "line" => {
+                painter.line_segment(
+                    [Pos2::new(left, bottom), Pos2::new(right, top)],
+                    icon_stroke,
+                );
+            }
+            "polyline" => {
+                painter.line_segment(
+                    [Pos2::new(left, bottom), Pos2::new(center.x, top + 2.0)],
+                    icon_stroke,
+                );
+                painter.line_segment(
+                    [
+                        Pos2::new(center.x, top + 2.0),
+                        Pos2::new(right, bottom - 3.0),
+                    ],
+                    icon_stroke,
+                );
+                painter.circle_filled(Pos2::new(left, bottom), 2.0, visuals.fg_stroke.color);
+                painter.circle_filled(Pos2::new(center.x, top + 2.0), 2.0, visuals.fg_stroke.color);
+                painter.circle_filled(Pos2::new(right, bottom - 3.0), 2.0, visuals.fg_stroke.color);
+            }
+            "polygon" => {
+                let points = (0..5)
+                    .map(|index| {
+                        let angle = -std::f32::consts::FRAC_PI_2
+                            + index as f32 * std::f32::consts::TAU / 5.0;
+                        Pos2::new(center.x + angle.cos() * 9.0, center.y + angle.sin() * 9.0)
+                    })
+                    .collect::<Vec<_>>();
+                painter.add(egui::Shape::closed_line(points, icon_stroke));
+            }
+            "rect" => {
+                painter.rect_stroke(
+                    Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom)),
+                    0.0,
+                    icon_stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+            "round_rect" => {
+                painter.rect_stroke(
+                    Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom)),
+                    4.0,
+                    icon_stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+            "ellipse" => {
+                painter.add(egui::Shape::ellipse_stroke(
+                    center,
+                    Vec2::new(10.0, 7.0),
+                    icon_stroke,
+                ));
+            }
+            "path" => {
+                let points = (0..=20)
+                    .map(|index| {
+                        let t = index as f32 / 20.0;
+                        Pos2::new(
+                            left + t * (right - left),
+                            center.y + (t * std::f32::consts::TAU).sin() * 6.0,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                painter.add(egui::Shape::line(points, icon_stroke));
+            }
+            _ => {}
+        }
+        response.on_hover_text(tool)
     }
 
     fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
@@ -1051,6 +1226,10 @@ impl DotStrokeApp {
     fn draw_canvas(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
         self.viewport_size = size;
+        let target_size = (self.doc.target.width, self.doc.target.height);
+        if self.last_fitted_target != Some(target_size) {
+            self.fit_canvas_to_viewport();
+        }
         let max_zoom = self.max_zoom();
         self.zoom = self.zoom.min(max_zoom);
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
@@ -1386,23 +1565,24 @@ impl eframe::App for DotStrokeApp {
         egui::Panel::left("tools").resizable(false).show(ui, |ui| {
             ui.heading("DotStroke");
             ui.label("Tool");
-            egui::ComboBox::from_id_salt("tool")
-                .selected_text(&self.tool)
-                .show_ui(ui, |ui| {
-                    for tool in [
-                        "select",
-                        "pixel",
-                        "line",
-                        "polyline",
-                        "polygon",
-                        "rect",
-                        "round_rect",
-                        "ellipse",
-                        "path",
-                    ] {
-                        ui.selectable_value(&mut self.tool, tool.into(), tool);
+            ui.horizontal_wrapped(|ui| {
+                for tool in [
+                    "select",
+                    "pixel",
+                    "line",
+                    "polyline",
+                    "polygon",
+                    "rect",
+                    "round_rect",
+                    "ellipse",
+                    "path",
+                ] {
+                    if Self::tool_icon(ui, tool, self.tool == tool).clicked() {
+                        self.tool = tool.into();
                     }
-                });
+                }
+            });
+            ui.label(format!("Selected: {}", self.tool));
             ui.separator();
             ui.label("Resolution");
             ui.horizontal(|ui| {
@@ -1430,6 +1610,46 @@ impl eframe::App for DotStrokeApp {
                         ui.selectable_value(&mut self.color, c.into(), c);
                     }
                 });
+            let selected_dither = if self.tool == "select" {
+                self.selected
+                    .and_then(|(layer_index, object_index)| {
+                        self.doc
+                            .layers
+                            .get(layer_index)
+                            .and_then(|layer| layer.objects.get(object_index))
+                    })
+                    .map(|object| object.style.dither_pattern.clone())
+            } else {
+                None
+            };
+            let mut dither_pattern = selected_dither.unwrap_or_else(|| self.dither_pattern.clone());
+            let original_dither_pattern = dither_pattern.clone();
+            ui.label("Dither pattern");
+            egui::ComboBox::from_id_salt("dither-pattern")
+                .selected_text(&dither_pattern)
+                .show_ui(ui, |ui| {
+                    for pattern in DITHER_PATTERNS {
+                        ui.selectable_value(&mut dither_pattern, pattern.into(), pattern);
+                    }
+                });
+            let dither_changed = dither_pattern != original_dither_pattern;
+            if dither_changed {
+                self.dither_pattern = dither_pattern.clone();
+                if self.tool == "select" {
+                    if let Some((layer_index, object_index)) = self.selected {
+                        self.save_history();
+                        if let Some(object) = self
+                            .doc
+                            .layers
+                            .get_mut(layer_index)
+                            .and_then(|layer| layer.objects.get_mut(object_index))
+                        {
+                            object.style.dither_pattern = dither_pattern;
+                            self.status = "Dither pattern changed".into();
+                        }
+                    }
+                }
+            }
             ui.add(egui::Slider::new(&mut self.width, 1..=8).text("Width"));
             ui.checkbox(&mut self.fill, "Fill closed shape");
             if self.tool == "round_rect" {
@@ -1469,30 +1689,6 @@ impl eframe::App for DotStrokeApp {
                 }
                 if ui.button("Redo").clicked() {
                     self.redo_document();
-                }
-            });
-            ui.separator();
-            ui.label("Vectors");
-            let vector_names: Vec<String> = self.doc.layers[self.current_layer]
-                .objects
-                .iter()
-                .enumerate()
-                .map(|(index, object)| format!("{}: {}", index + 1, object.kind))
-                .collect();
-            for (index, name) in vector_names.iter().enumerate() {
-                let is_selected = self.selected == Some((self.current_layer, index));
-                if ui.selectable_label(is_selected, name).clicked() {
-                    self.selected = Some((self.current_layer, index));
-                    self.selected_point = None;
-                    self.tool = "select".into();
-                }
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Delete").clicked() {
-                    self.delete_selected();
-                }
-                if ui.button("Duplicate").clicked() {
-                    self.duplicate_selected();
                 }
             });
             ui.separator();
@@ -1553,6 +1749,30 @@ impl eframe::App for DotStrokeApp {
             .show(ui, |ui| {
                 ui.heading("1-bit Preview");
                 self.preview(ui);
+                ui.separator();
+                ui.heading("Vectors");
+                let vector_names: Vec<String> = self.doc.layers[self.current_layer]
+                    .objects
+                    .iter()
+                    .enumerate()
+                    .map(|(index, object)| format!("{}: {}", index + 1, object.kind))
+                    .collect();
+                for (index, name) in vector_names.iter().enumerate() {
+                    let is_selected = self.selected == Some((self.current_layer, index));
+                    if ui.selectable_label(is_selected, name).clicked() {
+                        self.selected = Some((self.current_layer, index));
+                        self.selected_point = None;
+                        self.tool = "select".into();
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        self.delete_selected();
+                    }
+                    if ui.button("Duplicate").clicked() {
+                        self.duplicate_selected();
+                    }
+                });
             });
         egui::containers::CentralPanel::default().show(ui, |ui| {
             self.draw_canvas(ui);
