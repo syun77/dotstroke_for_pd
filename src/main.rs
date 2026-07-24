@@ -1,6 +1,8 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use muda::accelerator::{Accelerator, Code, Modifiers};
+use muda::{Menu, MenuEvent, MenuId, MenuItem, Submenu};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Write as _, fs};
+use std::{fmt::Write as _, fs, path::PathBuf};
 
 const DEFAULT_WIDTH: i32 = 32;
 const DEFAULT_HEIGHT: i32 = 32;
@@ -20,6 +22,64 @@ const DITHER_PATTERNS: [&str; 11] = [
     "burkes",
     "atkinson",
 ];
+
+struct NativeMenu {
+    menu: Menu,
+    new_id: MenuId,
+    load_id: MenuId,
+    save_id: MenuId,
+}
+
+impl NativeMenu {
+    fn new() -> Self {
+        let menu = Menu::new();
+        let new_item = MenuItem::new(
+            "New",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyN)),
+        );
+        let load_item = MenuItem::new(
+            "Load JSON",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyO)),
+        );
+        let save_item = MenuItem::new(
+            "Save JSON",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyS)),
+        );
+        let file_menu = Submenu::with_items("File", true, &[&new_item, &load_item, &save_item])
+            .expect("failed to create File menu");
+        menu.append(&file_menu).expect("failed to append File menu");
+        Self {
+            menu,
+            new_id: new_item.id().clone(),
+            load_id: load_item.id().clone(),
+            save_id: save_item.id().clone(),
+        }
+    }
+
+    fn init(&self) {
+        #[cfg(target_os = "macos")]
+        self.menu.init_for_nsapp();
+    }
+
+    fn actions(&self) -> (bool, bool, bool) {
+        let mut new = false;
+        let mut load = false;
+        let mut save = false;
+        for event in MenuEvent::receiver().try_iter() {
+            if event.id == self.new_id {
+                new = true;
+            } else if event.id == self.load_id {
+                load = true;
+            } else if event.id == self.save_id {
+                save = true;
+            }
+        }
+        (new, load, save)
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -146,6 +206,8 @@ struct DotStrokeApp {
     new_dialog: bool,
     new_width: String,
     new_height: String,
+    current_file: Option<PathBuf>,
+    native_menu: NativeMenu,
 }
 
 impl Default for DotStrokeApp {
@@ -174,6 +236,8 @@ impl Default for DotStrokeApp {
             new_dialog: false,
             new_width: DEFAULT_WIDTH.to_string(),
             new_height: DEFAULT_HEIGHT.to_string(),
+            current_file: None,
+            native_menu: NativeMenu::new(),
         }
     }
 }
@@ -212,6 +276,55 @@ impl DotStrokeApp {
                 .current_layer
                 .min(self.doc.layers.len().saturating_sub(1));
             self.status = "Redo".into();
+        }
+    }
+
+    fn begin_new_document(&mut self) {
+        self.new_width = self.doc.target.width.to_string();
+        self.new_height = self.doc.target.height.to_string();
+        self.new_dialog = true;
+    }
+
+    fn load_json_document(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        {
+            match fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Document>(&s).ok())
+            {
+                Some(doc) => {
+                    self.save_history();
+                    self.doc = doc;
+                    self.current_file = Some(path.clone());
+                    self.pending.clear();
+                    self.selected = None;
+                    self.selected_point = None;
+                    self.status = format!("Loaded {}", path.display());
+                }
+                None => self.status = "Failed to load JSON".into(),
+            }
+        }
+    }
+
+    fn save_json_document(&mut self) {
+        let path = self.current_file.clone().or_else(|| {
+            rfd::FileDialog::new()
+                .set_file_name("document.json")
+                .save_file()
+        });
+        if let Some(path) = path {
+            match serde_json::to_string_pretty(&self.doc)
+                .ok()
+                .and_then(|s| fs::write(&path, s).ok())
+            {
+                Some(_) => {
+                    self.current_file = Some(path.clone());
+                    self.status = format!("Saved {}", path.display());
+                }
+                None => self.status = "Failed to save JSON".into(),
+            }
         }
     }
 
@@ -1549,6 +1662,9 @@ impl DotStrokeApp {
 
 impl eframe::App for DotStrokeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
         let (undo_pressed, redo_pressed) = ui.input(|input| {
             let modifier = input.modifiers.ctrl || input.modifiers.command;
             (
@@ -1562,6 +1678,77 @@ impl eframe::App for DotStrokeApp {
         if redo_pressed {
             self.redo_document();
         }
+        let (native_new, native_load, native_save, native_copy_playdate_lua) =
+            self.native_menu.actions();
+        let (shortcut_new, shortcut_load, shortcut_save, shortcut_copy_playdate_lua) =
+            if cfg!(target_os = "macos") {
+                (false, false, false, false)
+            } else {
+                ui.input(|input| {
+                    let modifier = input.modifiers.ctrl || input.modifiers.command;
+                    (
+                        modifier && input.key_pressed(egui::Key::N), // 新規作成.
+                        modifier && input.key_pressed(egui::Key::O), // JSON読み込み.
+                        modifier && input.key_pressed(egui::Key::S), // JSON保存.
+                        modifier && input.key_pressed(egui::Key::P), // Copy Playdate Lua.
+                    )
+                })
+            };
+        if native_new || shortcut_new {
+            self.begin_new_document();
+        }
+        if native_load || shortcut_load {
+            self.load_json_document();
+        }
+        if native_save || shortcut_save {
+            self.save_json_document();
+        }
+        if native_copy_playdate_lua || shortcut_copy_playdate_lua {
+            ui.ctx().copy_text(self.playdate_lua());
+            self.status = "Copied Playdate Lua".into();
+        }
+        egui::Panel::top("menu").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("New    Cmd+N").clicked() {
+                        self.begin_new_document();
+                        ui.close();
+                    }
+                    if ui.button("Load JSON    Cmd+O").clicked() {
+                        self.load_json_document();
+                        ui.close();
+                    }
+                    if ui.button("Save JSON    Cmd+S").clicked() {
+                        self.save_json_document();
+                        ui.close();
+                    }
+                    if ui.button("Copy Playdate Lua    Cmd+P").clicked() {
+                        ui.ctx().copy_text(self.playdate_lua());
+                        self.status = "Copied Playdate Lua".into();
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Resolution", |ui| {
+                    ui.label(format!(
+                        "Current: {} x {}",
+                        self.doc.target.width, self.doc.target.height
+                    ));
+                    ui.separator();
+                    if ui.button("32 x 32").clicked() {
+                        self.save_history();
+                        self.doc.target.width = 32;
+                        self.doc.target.height = 32;
+                        ui.close();
+                    }
+                    if ui.button("400 x 240").clicked() {
+                        self.save_history();
+                        self.doc.target.width = 400;
+                        self.doc.target.height = 240;
+                        ui.close();
+                    }
+                });
+            });
+        });
         egui::Panel::left("tools").resizable(false).show(ui, |ui| {
             ui.heading("DotStroke");
             ui.label("Tool");
@@ -1583,24 +1770,6 @@ impl eframe::App for DotStrokeApp {
                 }
             });
             ui.label(format!("Selected: {}", self.tool));
-            ui.separator();
-            ui.label("Resolution");
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "{} x {}",
-                    self.doc.target.width, self.doc.target.height
-                ));
-                if ui.button("32x32").clicked() {
-                    self.save_history();
-                    self.doc.target.width = 32;
-                    self.doc.target.height = 32;
-                }
-                if ui.button("400x240").clicked() {
-                    self.save_history();
-                    self.doc.target.width = 400;
-                    self.doc.target.height = 240;
-                }
-            });
             ui.separator();
             ui.label("Style");
             egui::ComboBox::from_id_salt("color")
@@ -1692,47 +1861,6 @@ impl eframe::App for DotStrokeApp {
                 }
             });
             ui.separator();
-            if ui.button("New").clicked() {
-                self.save_history();
-                self.doc = Document::default();
-                self.pending.clear();
-            }
-            if ui.button("Load JSON").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("JSON", &["json"])
-                    .pick_file()
-                {
-                    match fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<Document>(&s).ok())
-                    {
-                        Some(doc) => {
-                            self.save_history();
-                            self.doc = doc;
-                            self.status = format!("Loaded {}", path.display());
-                        }
-                        None => self.status = "Failed to load JSON".into(),
-                    }
-                }
-            }
-            if ui.button("Save JSON").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_file_name("document.json")
-                    .save_file()
-                {
-                    match serde_json::to_string_pretty(&self.doc)
-                        .ok()
-                        .and_then(|s| fs::write(&path, s).ok())
-                    {
-                        Some(_) => self.status = format!("Saved {}", path.display()),
-                        None => self.status = "Failed to save JSON".into(),
-                    }
-                }
-            }
-            if ui.button("Copy Playdate Lua").clicked() {
-                ui.ctx().copy_text(self.playdate_lua());
-                self.status = "Copied Playdate Lua".into();
-            }
             ui.separator();
             ui.label(&self.status);
             ui.label("Space + left-drag: pan");
@@ -1777,19 +1905,82 @@ impl eframe::App for DotStrokeApp {
         egui::containers::CentralPanel::default().show(ui, |ui| {
             self.draw_canvas(ui);
         });
+        if self.new_dialog {
+            let mut create_document = None;
+            egui::Window::new("New Document")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Canvas resolution");
+                    ui.horizontal(|ui| {
+                        ui.label("Width");
+                        ui.add(egui::TextEdit::singleline(&mut self.new_width).desired_width(70.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Height");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_height).desired_width(70.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Create").clicked() {
+                            let width = self.new_width.trim().parse::<i32>().ok();
+                            let height = self.new_height.trim().parse::<i32>().ok();
+                            if let (Some(width), Some(height)) = (width, height) {
+                                if width > 0 && height > 0 {
+                                    create_document = Some((width, height));
+                                } else {
+                                    self.status = "Resolution must be positive".into();
+                                }
+                            } else {
+                                self.status = "Enter numeric width and height".into();
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.new_dialog = false;
+                        }
+                    });
+                });
+            if let Some((width, height)) = create_document {
+                self.save_history();
+                self.doc = Document::default();
+                self.doc.target.width = width;
+                self.doc.target.height = height;
+                self.current_file = None;
+                self.pending.clear();
+                self.selected = None;
+                self.selected_point = None;
+                self.current_layer = 0;
+                self.new_dialog = false;
+                self.status = format!("New document: {} x {}", width, height);
+            }
+        }
     }
 }
 
 fn main() -> eframe::Result {
+    let native_menu = NativeMenu::new();
+    native_menu.init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DotStroke for Playdate (egui)")
             .with_inner_size([1500.0, 760.0]),
+        event_loop_builder: Some(Box::new(|builder| {
+            #[cfg(target_os = "macos")]
+            {
+                use winit::platform::macos::EventLoopBuilderExtMacOS;
+                builder.with_default_menu(false);
+            }
+        })),
         ..Default::default()
     };
     eframe::run_native(
         "DotStroke",
         options,
-        Box::new(|_cc| Ok(Box::new(DotStrokeApp::default()))),
+        Box::new(move |_cc| {
+            let mut app = DotStrokeApp::default();
+            app.native_menu = native_menu;
+            Ok(Box::new(app))
+        }),
     )
 }
