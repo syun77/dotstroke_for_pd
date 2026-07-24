@@ -115,6 +115,7 @@ struct DotStrokeApp {
     fill: bool,
     radius: i32,
     rounding: String,
+    pixel_preview: bool,
     zoom: f32,
     pan: Vec2,
     viewport_size: Vec2,
@@ -137,6 +138,7 @@ impl Default for DotStrokeApp {
             fill: false,
             radius: 4,
             rounding: "nearest".into(),
+            pixel_preview: false,
             zoom: 2.0,
             pan: Vec2::ZERO,
             viewport_size: Vec2::new(800.0, 600.0),
@@ -702,6 +704,350 @@ impl DotStrokeApp {
         }
     }
 
+    fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
+        let segment = end - start;
+        let length_sq = segment.length_sq();
+        if length_sq <= f32::EPSILON {
+            return point.distance(start);
+        }
+        let t = ((point - start).dot(segment) / length_sq).clamp(0.0, 1.0);
+        point.distance(start + segment * t)
+    }
+
+    fn point_in_polygon(point: Pos2, points: &[[f32; 2]]) -> bool {
+        let mut inside = false;
+        for (a, b) in points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+        {
+            let intersects = (a[1] > point.y) != (b[1] > point.y)
+                && point.x < (b[0] - a[0]) * (point.y - a[1]) / (b[1] - a[1]) + a[0];
+            if intersects {
+                inside = !inside;
+            }
+        }
+        inside
+    }
+
+    fn put_raster_pixel(
+        pixels: &mut [Color32],
+        width: usize,
+        height: usize,
+        x: i32,
+        y: i32,
+        color: Color32,
+        line_width: f32,
+    ) {
+        let brush_radius = ((line_width.ceil() - 1.0) / 2.0).floor() as i32;
+        for dy in -brush_radius..=brush_radius {
+            for dx in -brush_radius..=brush_radius {
+                if dx * dx + dy * dy > brush_radius * brush_radius {
+                    continue;
+                }
+                let px = x + dx;
+                let py = y + dy;
+                if px >= 0 && py >= 0 && (px as usize) < width && (py as usize) < height {
+                    pixels[py as usize * width + px as usize] = color;
+                }
+            }
+        }
+    }
+
+    fn draw_raster_line(
+        pixels: &mut [Color32],
+        width: usize,
+        height: usize,
+        start: Pos2,
+        end: Pos2,
+        color: Color32,
+        line_width: f32,
+    ) {
+        let mut x0 = start.x.round() as i32;
+        let mut y0 = start.y.round() as i32;
+        let x1 = end.x.round() as i32;
+        let y1 = end.y.round() as i32;
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut error = dx + dy;
+
+        loop {
+            Self::put_raster_pixel(pixels, width, height, x0, y0, color, line_width);
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let twice_error = 2 * error;
+            if twice_error >= dy {
+                error += dy;
+                x0 += sx;
+            }
+            if twice_error <= dx {
+                error += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    fn draw_raster_ellipse(
+        pixels: &mut [Color32],
+        width: usize,
+        height: usize,
+        bounds: [f32; 4],
+        color: Color32,
+        line_width: f32,
+    ) {
+        let left = bounds[0].round() as i32;
+        let top = bounds[1].round() as i32;
+        let right = bounds[2].round() as i32;
+        let bottom = bounds[3].round() as i32;
+        let rx = ((right - left).abs() / 2).max(1);
+        let ry = ((bottom - top).abs() / 2).max(1);
+        let center_x = (left + right) / 2;
+        let center_y = (top + bottom) / 2;
+        let rx_squared = rx * rx;
+        let ry_squared = ry * ry;
+        let mut x = 0_i32;
+        let mut y = ry;
+        let mut decision = ry_squared - rx_squared * ry + rx_squared / 4;
+
+        while 2 * ry_squared * x <= 2 * rx_squared * y {
+            for (px, py) in [
+                (center_x + x, center_y + y),
+                (center_x - x, center_y + y),
+                (center_x + x, center_y - y),
+                (center_x - x, center_y - y),
+            ] {
+                Self::put_raster_pixel(pixels, width, height, px, py, color, line_width);
+            }
+            if decision < 0 {
+                x += 1;
+                decision += 2 * ry_squared * x + ry_squared;
+            } else {
+                x += 1;
+                y -= 1;
+                decision += 2 * ry_squared * x - 2 * rx_squared * y + ry_squared;
+            }
+        }
+
+        decision =
+            ry_squared * (x * x + x) + rx_squared * (y - 1) * (y - 1) - rx_squared * ry_squared;
+        while y >= 0 {
+            for (px, py) in [
+                (center_x + x, center_y + y),
+                (center_x - x, center_y + y),
+                (center_x + x, center_y - y),
+                (center_x - x, center_y - y),
+            ] {
+                Self::put_raster_pixel(pixels, width, height, px, py, color, line_width);
+            }
+            if decision > 0 {
+                y -= 1;
+                decision -= 2 * rx_squared * y + rx_squared;
+            } else {
+                y -= 1;
+                x += 1;
+                decision += 2 * ry_squared * x - 2 * rx_squared * y + rx_squared;
+            }
+        }
+    }
+
+    fn rasterize_object(
+        &self,
+        pixels: &mut [Color32],
+        width: usize,
+        height: usize,
+        object: &VectorObject,
+    ) {
+        if !object.visible || object.points.is_empty() {
+            return;
+        }
+        let color = match object.style.color.as_str() {
+            "white" => Color32::WHITE,
+            "clear" => Color32::WHITE,
+            _ => Color32::BLACK,
+        };
+        let stroke_width = object.style.width.max(1) as f32;
+        let points: Vec<Pos2> = object
+            .points
+            .iter()
+            .map(|point| Pos2::new(point[0], point[1]))
+            .collect();
+        if matches!(object.kind.as_str(), "line" | "polyline" | "path") && points.len() >= 2 {
+            for pair in points.windows(2) {
+                Self::draw_raster_line(
+                    pixels,
+                    width,
+                    height,
+                    pair[0],
+                    pair[1],
+                    color,
+                    stroke_width,
+                );
+            }
+            if object.closed && points.len() > 2 {
+                Self::draw_raster_line(
+                    pixels,
+                    width,
+                    height,
+                    *points.last().unwrap(),
+                    points[0],
+                    color,
+                    stroke_width,
+                );
+            }
+            for child in &object.children {
+                self.rasterize_object(pixels, width, height, child);
+            }
+            return;
+        }
+        if object.kind == "ellipse" && !object.style.fill && points.len() >= 2 {
+            Self::draw_raster_ellipse(
+                pixels,
+                width,
+                height,
+                [points[0].x, points[0].y, points[1].x, points[1].y],
+                color,
+                stroke_width,
+            );
+            for child in &object.children {
+                self.rasterize_object(pixels, width, height, child);
+            }
+            return;
+        }
+        let min_x = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(0.0) as usize;
+        let max_x = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil()
+            .min(width as f32 - 1.0) as usize;
+        let min_y = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(0.0) as usize;
+        let max_y = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil()
+            .min(height as f32 - 1.0) as usize;
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        if object.kind == "polygon" && points.len() >= 3 {
+            for (start, end) in points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .take(points.len())
+            {
+                Self::draw_raster_line(pixels, width, height, *start, *end, color, stroke_width);
+            }
+            if !object.style.fill {
+                for child in &object.children {
+                    self.rasterize_object(pixels, width, height, child);
+                }
+                return;
+            }
+        }
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let sample = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let drawn = match object.kind.as_str() {
+                    "pixel" => sample.distance(points[0]) <= stroke_width,
+                    "rect" | "round_rect" if points.len() >= 2 => {
+                        let left = points[0].x.min(points[1].x);
+                        let right = points[0].x.max(points[1].x);
+                        let top = points[0].y.min(points[1].y);
+                        let bottom = points[0].y.max(points[1].y);
+                        let inside = sample.x >= left
+                            && sample.x <= right
+                            && sample.y >= top
+                            && sample.y <= bottom;
+                        let edge_distance = (sample.x - left)
+                            .min(right - sample.x)
+                            .min((sample.y - top).min(bottom - sample.y));
+                        inside && (object.style.fill || edge_distance <= stroke_width / 2.0)
+                    }
+                    "ellipse" if points.len() >= 2 => {
+                        let left = points[0].x.min(points[1].x);
+                        let right = points[0].x.max(points[1].x);
+                        let top = points[0].y.min(points[1].y);
+                        let bottom = points[0].y.max(points[1].y);
+                        let rx = (right - left) / 2.0;
+                        let ry = (bottom - top) / 2.0;
+                        if rx <= 0.0 || ry <= 0.0 {
+                            false
+                        } else {
+                            let dx = (sample.x - (left + right) / 2.0) / rx;
+                            let dy = (sample.y - (top + bottom) / 2.0) / ry;
+                            let value = dx * dx + dy * dy;
+                            object.style.fill && value <= 1.0
+                                || !object.style.fill
+                                    && (value - 1.0).abs() * rx.min(ry) <= stroke_width / 2.0
+                        }
+                    }
+                    "polygon" if points.len() >= 3 => {
+                        let filled =
+                            object.style.fill && Self::point_in_polygon(sample, &object.points);
+                        let edge = points
+                            .iter()
+                            .zip(points.iter().cycle().skip(1))
+                            .take(points.len())
+                            .any(|(start, end)| {
+                                Self::distance_to_segment(sample, *start, *end)
+                                    <= stroke_width / 2.0
+                            });
+                        filled || edge
+                    }
+                    _ if points.len() >= 2 => {
+                        points.windows(2).any(|pair| {
+                            Self::distance_to_segment(sample, pair[0], pair[1])
+                                <= stroke_width / 2.0
+                        }) || (object.closed
+                            && Self::distance_to_segment(
+                                sample,
+                                *points.last().unwrap(),
+                                points[0],
+                            ) <= stroke_width / 2.0)
+                    }
+                    _ => false,
+                };
+                if drawn {
+                    pixels[y * width + x] = color;
+                }
+            }
+        }
+
+        for child in &object.children {
+            self.rasterize_object(pixels, width, height, child);
+        }
+    }
+
+    fn pixel_preview(&self) -> Vec<Color32> {
+        let width = self.doc.target.width.max(1) as usize;
+        let height = self.doc.target.height.max(1) as usize;
+        let mut pixels = vec![Color32::WHITE; width * height];
+        for layer in &self.doc.layers {
+            if layer.visible {
+                for object in &layer.objects {
+                    self.rasterize_object(&mut pixels, width, height, object);
+                }
+            }
+        }
+        pixels
+    }
+
     fn draw_canvas(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
         self.viewport_size = size;
@@ -772,40 +1118,117 @@ impl DotStrokeApp {
         } else {
             None
         };
-        for layer in &self.doc.layers {
-            if layer.visible {
-                for (index, object) in layer.objects.iter().enumerate() {
-                    self.draw_object(&painter, rect, object);
-                    if self.selected == Some((self.current_layer, index))
-                        && !object.points.is_empty()
-                    {
-                        for (point_index, point) in object.points.iter().enumerate() {
-                            let is_dragging_point = response
-                                .dragged_by(egui::PointerButton::Primary)
-                                && self.selected_point == Some(point_index);
-                            let is_hovered =
-                                hovered_control_point == Some(point_index) || is_dragging_point;
-                            let radius = if is_hovered {
-                                CONTROL_POINT_HOVER_RADIUS
-                            } else {
-                                CONTROL_POINT_RADIUS
-                            };
-                            if is_hovered {
-                                painter.circle_filled(
+        if self.pixel_preview {
+            let pixels = self.pixel_preview();
+            let width = self.doc.target.width.max(1) as usize;
+            for (index, color) in pixels.into_iter().enumerate() {
+                let x = index % width;
+                let y = index / width;
+                let pixel_rect = Rect::from_min_size(
+                    Pos2::new(
+                        canvas_rect.left() + x as f32 * self.zoom,
+                        canvas_rect.top() + y as f32 * self.zoom,
+                    ),
+                    Vec2::splat(self.zoom),
+                );
+                painter.rect_filled(pixel_rect, 0.0, color);
+            }
+        } else {
+            for layer in &self.doc.layers {
+                if layer.visible {
+                    for (index, object) in layer.objects.iter().enumerate() {
+                        self.draw_object(&painter, rect, object);
+                        if self.selected == Some((self.current_layer, index))
+                            && !object.points.is_empty()
+                        {
+                            for (point_index, point) in object.points.iter().enumerate() {
+                                let is_dragging_point = response
+                                    .dragged_by(egui::PointerButton::Primary)
+                                    && self.selected_point == Some(point_index);
+                                let is_hovered =
+                                    hovered_control_point == Some(point_index) || is_dragging_point;
+                                let radius = if is_hovered {
+                                    CONTROL_POINT_HOVER_RADIUS
+                                } else {
+                                    CONTROL_POINT_RADIUS
+                                };
+                                if is_hovered {
+                                    painter.circle_filled(
+                                        self.doc_to_screen(rect, *point),
+                                        radius,
+                                        Color32::from_rgba_unmultiplied(255, 0, 100, 70),
+                                    );
+                                }
+                                painter.circle_stroke(
                                     self.doc_to_screen(rect, *point),
                                     radius,
-                                    Color32::from_rgba_unmultiplied(255, 0, 100, 70),
+                                    Stroke::new(
+                                        if is_hovered { 2.5 } else { 1.5 },
+                                        Color32::from_rgb(255, 0, 100),
+                                    ),
                                 );
                             }
-                            painter.circle_stroke(
+                        }
+                    }
+                }
+            }
+        }
+        if self.pixel_preview && self.zoom >= 1.0 {
+            let pixel_grid = Stroke::new(0.5, Color32::from_rgba_unmultiplied(150, 150, 150, 120));
+            for x in 0..=self.doc.target.width {
+                let sx = canvas_rect.left() + x as f32 * self.zoom;
+                painter.line_segment(
+                    [
+                        Pos2::new(sx, canvas_rect.top()),
+                        Pos2::new(sx, canvas_rect.bottom()),
+                    ],
+                    pixel_grid,
+                );
+            }
+            for y in 0..=self.doc.target.height {
+                let sy = canvas_rect.top() + y as f32 * self.zoom;
+                painter.line_segment(
+                    [
+                        Pos2::new(canvas_rect.left(), sy),
+                        Pos2::new(canvas_rect.right(), sy),
+                    ],
+                    pixel_grid,
+                );
+            }
+        }
+        if self.pixel_preview {
+            if let Some((layer_index, object_index)) = self.selected {
+                if let Some(object) = self
+                    .doc
+                    .layers
+                    .get(layer_index)
+                    .and_then(|layer| layer.objects.get(object_index))
+                {
+                    for (point_index, point) in object.points.iter().enumerate() {
+                        let is_dragging_point = response.dragged_by(egui::PointerButton::Primary)
+                            && self.selected_point == Some(point_index);
+                        let is_hovered =
+                            hovered_control_point == Some(point_index) || is_dragging_point;
+                        let radius = if is_hovered {
+                            CONTROL_POINT_HOVER_RADIUS
+                        } else {
+                            CONTROL_POINT_RADIUS
+                        };
+                        if is_hovered {
+                            painter.circle_filled(
                                 self.doc_to_screen(rect, *point),
                                 radius,
-                                Stroke::new(
-                                    if is_hovered { 2.5 } else { 1.5 },
-                                    Color32::from_rgb(255, 0, 100),
-                                ),
+                                Color32::from_rgba_unmultiplied(255, 0, 100, 70),
                             );
                         }
+                        painter.circle_stroke(
+                            self.doc_to_screen(rect, *point),
+                            radius,
+                            Stroke::new(
+                                if is_hovered { 2.5 } else { 1.5 },
+                                Color32::from_rgb(255, 0, 100),
+                            ),
+                        );
                     }
                 }
             }
@@ -1012,6 +1435,7 @@ impl eframe::App for DotStrokeApp {
             if self.tool == "round_rect" {
                 ui.add(egui::Slider::new(&mut self.radius, 0..=16).text("Corner radius"));
             }
+            ui.checkbox(&mut self.pixel_preview, "Pixel preview");
             egui::ComboBox::from_id_salt("rounding")
                 .selected_text(&self.rounding)
                 .show_ui(ui, |ui| {
