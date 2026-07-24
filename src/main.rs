@@ -2,7 +2,12 @@ use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use muda::accelerator::{Accelerator, Code, Modifiers};
 use muda::{Menu, MenuEvent, MenuId, MenuItem, Submenu};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Write as _, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
 const DEFAULT_WIDTH: i32 = 32;
 const DEFAULT_HEIGHT: i32 = 32;
@@ -22,6 +27,7 @@ const DITHER_PATTERNS: [&str; 11] = [
     "burkes",
     "atkinson",
 ];
+const DITHER_ICON_DIR: &str = "assets/dither_icons";
 
 struct NativeMenu {
     menu: Menu,
@@ -208,6 +214,7 @@ struct DotStrokeApp {
     new_height: String,
     current_file: Option<PathBuf>,
     native_menu: NativeMenu,
+    dither_icons: HashMap<String, egui::TextureHandle>,
 }
 
 impl Default for DotStrokeApp {
@@ -238,6 +245,7 @@ impl Default for DotStrokeApp {
             new_height: DEFAULT_HEIGHT.to_string(),
             current_file: None,
             native_menu: NativeMenu::new(),
+            dither_icons: HashMap::new(),
         }
     }
 }
@@ -325,6 +333,37 @@ impl DotStrokeApp {
                 }
                 None => self.status = "Failed to save JSON".into(),
             }
+        }
+    }
+
+    fn load_dither_icons(&mut self, ctx: &egui::Context) {
+        let icon_dirs = [
+            PathBuf::from(DITHER_ICON_DIR),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(DITHER_ICON_DIR),
+        ];
+        for pattern in DITHER_PATTERNS {
+            let Some(path) = icon_dirs
+                .iter()
+                .map(|dir| dir.join(format!("{pattern}.png")))
+                .find(|path| path.is_file())
+            else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(decoded) = image::load_from_memory(&bytes) else {
+                continue;
+            };
+            let rgba = decoded.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            let texture = ctx.load_texture(
+                format!("dither-icon-{pattern}"),
+                color_image,
+                egui::TextureOptions::NEAREST,
+            );
+            self.dither_icons.insert(pattern.into(), texture);
         }
     }
 
@@ -781,7 +820,18 @@ impl DotStrokeApp {
             }
             "ellipse" if pts.len() >= 2 => {
                 let r = Rect::from_two_pos(pts[0], pts[1]);
-                painter.circle_stroke(r.center(), r.width().min(r.height()) / 2.0, stroke);
+                if object.style.fill {
+                    painter.add(egui::Shape::ellipse_filled(
+                        r.center(),
+                        Vec2::new(r.width() / 2.0, r.height() / 2.0),
+                        color,
+                    ));
+                }
+                painter.add(egui::Shape::ellipse_stroke(
+                    r.center(),
+                    Vec2::new(r.width() / 2.0, r.height() / 2.0),
+                    stroke,
+                ));
             }
             _ => {
                 for pair in pts.windows(2) {
@@ -851,6 +901,13 @@ impl DotStrokeApp {
                         };
                         painter.rect_filled(bounds, radius, preview_fill);
                     }
+                    if self.tool == "ellipse" && self.fill {
+                        painter.add(egui::Shape::ellipse_filled(
+                            bounds.center(),
+                            Vec2::new(bounds.width() / 2.0, bounds.height() / 2.0),
+                            preview_fill,
+                        ));
+                    }
                     if self.tool == "rect" {
                         painter.rect_stroke(bounds, 0.0, preview_stroke, egui::StrokeKind::Middle);
                     } else if self.tool == "round_rect" {
@@ -875,7 +932,7 @@ impl DotStrokeApp {
         }
     }
 
-    fn tool_icon(ui: &mut egui::Ui, tool: &str, selected: bool) -> egui::Response {
+    fn tool_icon(ui: &mut egui::Ui, tool: &str, selected: bool, filled: bool) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
         let painter = ui.painter_at(rect);
         let visuals = ui.style().interact_selectable(&response, selected);
@@ -950,25 +1007,38 @@ impl DotStrokeApp {
                         Pos2::new(center.x + angle.cos() * 9.0, center.y + angle.sin() * 9.0)
                     })
                     .collect::<Vec<_>>();
-                painter.add(egui::Shape::closed_line(points, icon_stroke));
+                if filled {
+                    painter.add(egui::Shape::convex_polygon(
+                        points,
+                        visuals.fg_stroke.color,
+                        icon_stroke,
+                    ));
+                } else {
+                    painter.add(egui::Shape::closed_line(points, icon_stroke));
+                }
             }
             "rect" => {
-                painter.rect_stroke(
-                    Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom)),
-                    0.0,
-                    icon_stroke,
-                    egui::StrokeKind::Inside,
-                );
+                let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+                if filled {
+                    painter.rect_filled(bounds, 0.0, visuals.fg_stroke.color);
+                }
+                painter.rect_stroke(bounds, 0.0, icon_stroke, egui::StrokeKind::Inside);
             }
             "round_rect" => {
-                painter.rect_stroke(
-                    Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom)),
-                    4.0,
-                    icon_stroke,
-                    egui::StrokeKind::Inside,
-                );
+                let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+                if filled {
+                    painter.rect_filled(bounds, 4.0, visuals.fg_stroke.color);
+                }
+                painter.rect_stroke(bounds, 4.0, icon_stroke, egui::StrokeKind::Inside);
             }
             "ellipse" => {
+                if filled {
+                    painter.add(egui::Shape::ellipse_filled(
+                        center,
+                        Vec2::new(10.0, 7.0),
+                        visuals.fg_stroke.color,
+                    ));
+                }
                 painter.add(egui::Shape::ellipse_stroke(
                     center,
                     Vec2::new(10.0, 7.0),
@@ -990,6 +1060,221 @@ impl DotStrokeApp {
             _ => {}
         }
         response.on_hover_text(tool)
+    }
+
+    fn color_icon(ui: &mut egui::Ui, color: &str, selected: bool) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+        let painter = ui.painter_at(rect);
+        let visuals = ui.style().interact_selectable(&response, selected);
+        painter.rect(
+            rect,
+            4.0,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Outside,
+        );
+        let swatch = rect.shrink(8.0);
+        match color {
+            "black" => {
+                painter.rect_filled(swatch, 2.0, Color32::BLACK);
+            }
+            "white" => {
+                painter.rect_filled(swatch, 2.0, Color32::WHITE);
+                painter.rect_stroke(
+                    swatch,
+                    2.0,
+                    Stroke::new(1.0, Color32::DARK_GRAY),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            "clear" => {
+                let half = swatch.width() / 2.0;
+                for row in 0..2 {
+                    for column in 0..2 {
+                        let cell = Rect::from_min_size(
+                            Pos2::new(
+                                swatch.left() + column as f32 * half,
+                                swatch.top() + row as f32 * half,
+                            ),
+                            Vec2::splat(half),
+                        );
+                        painter.rect_filled(
+                            cell,
+                            0.0,
+                            if (row + column) % 2 == 0 {
+                                Color32::from_gray(215)
+                            } else {
+                                Color32::WHITE
+                            },
+                        );
+                    }
+                }
+                painter.line_segment(
+                    [swatch.left_top(), swatch.right_bottom()],
+                    Stroke::new(1.5, Color32::from_rgb(60, 150, 255)),
+                );
+                painter.rect_stroke(
+                    swatch,
+                    2.0,
+                    Stroke::new(1.0, Color32::DARK_GRAY),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            _ => {}
+        }
+        response.on_hover_text(color)
+    }
+
+    fn dither_icon(
+        ui: &mut egui::Ui,
+        pattern: &str,
+        selected: bool,
+        texture: Option<&egui::TextureHandle>,
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+        let painter = ui.painter_at(rect);
+        let visuals = ui.style().interact_selectable(&response, selected);
+        painter.rect(
+            rect,
+            4.0,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Outside,
+        );
+
+        let sample = rect.shrink(7.0);
+        painter.rect_filled(sample, 1.0, Color32::WHITE);
+        painter.rect_stroke(
+            sample,
+            1.0,
+            Stroke::new(0.8, Color32::GRAY),
+            egui::StrokeKind::Inside,
+        );
+        if let Some(texture) = texture {
+            painter.image(
+                texture.id(),
+                sample,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            return response.on_hover_text(pattern);
+        }
+        let ink = visuals.fg_stroke.color;
+        let dot = |x: f32, y: f32| {
+            painter.circle_filled(
+                Pos2::new(
+                    sample.left() + x * sample.width(),
+                    sample.top() + y * sample.height(),
+                ),
+                1.5,
+                ink,
+            );
+        };
+        let line = |a: (f32, f32), b: (f32, f32)| {
+            painter.line_segment(
+                [
+                    Pos2::new(
+                        sample.left() + a.0 * sample.width(),
+                        sample.top() + a.1 * sample.height(),
+                    ),
+                    Pos2::new(
+                        sample.left() + b.0 * sample.width(),
+                        sample.top() + b.1 * sample.height(),
+                    ),
+                ],
+                Stroke::new(1.3, ink),
+            );
+        };
+        match pattern {
+            "diagonal_line" => line((0.05, 0.95), (0.95, 0.05)),
+            "vertical_line" => {
+                line((0.25, 0.05), (0.25, 0.95));
+                line((0.75, 0.05), (0.75, 0.95));
+            }
+            "horizontal_line" => {
+                line((0.05, 0.25), (0.95, 0.25));
+                line((0.05, 0.75), (0.95, 0.75));
+            }
+            "screen" => {
+                for (x, y) in [(0.25, 0.25), (0.75, 0.75)] {
+                    dot(x, y);
+                }
+            }
+            "bayer_2x2" => {
+                dot(0.25, 0.25);
+            }
+            "bayer_4x4" => {
+                for (x, y) in [
+                    (0.125, 0.125),
+                    (0.625, 0.125),
+                    (0.375, 0.375),
+                    (0.875, 0.375),
+                ] {
+                    dot(x, y);
+                }
+                for (x, y) in [
+                    (0.125, 0.625),
+                    (0.625, 0.625),
+                    (0.375, 0.875),
+                    (0.875, 0.875),
+                ] {
+                    dot(x, y);
+                }
+            }
+            "bayer_8x8" => {
+                for (x, y) in [
+                    (0.0625, 0.0625),
+                    (0.3125, 0.1875),
+                    (0.5625, 0.0625),
+                    (0.8125, 0.1875),
+                    (0.1875, 0.4375),
+                    (0.4375, 0.5625),
+                    (0.6875, 0.4375),
+                    (0.9375, 0.5625),
+                    (0.0625, 0.8125),
+                    (0.3125, 0.9375),
+                    (0.5625, 0.8125),
+                    (0.8125, 0.9375),
+                ] {
+                    dot(x, y);
+                }
+            }
+            "floyd_steinberg" => {
+                for (x, y) in [
+                    (0.2, 0.2),
+                    (0.5, 0.35),
+                    (0.8, 0.2),
+                    (0.35, 0.75),
+                    (0.7, 0.65),
+                ] {
+                    dot(x, y);
+                }
+            }
+            "burkes" => {
+                for (x, y) in [
+                    (0.15, 0.2),
+                    (0.4, 0.2),
+                    (0.75, 0.3),
+                    (0.25, 0.7),
+                    (0.6, 0.8),
+                ] {
+                    dot(x, y);
+                }
+            }
+            "atkinson" => {
+                for (x, y) in [
+                    (0.25, 0.2),
+                    (0.6, 0.2),
+                    (0.4, 0.5),
+                    (0.75, 0.65),
+                    (0.2, 0.8),
+                ] {
+                    dot(x, y);
+                }
+            }
+            _ => {}
+        }
+        response.on_hover_text(pattern)
     }
 
     fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
@@ -1678,22 +1963,17 @@ impl eframe::App for DotStrokeApp {
         if redo_pressed {
             self.redo_document();
         }
-        let (native_new, native_load, native_save, native_copy_playdate_lua) =
-            self.native_menu.actions();
+        let (native_new, native_load, native_save) = self.native_menu.actions();
         let (shortcut_new, shortcut_load, shortcut_save, shortcut_copy_playdate_lua) =
-            if cfg!(target_os = "macos") {
-                (false, false, false, false)
-            } else {
-                ui.input(|input| {
-                    let modifier = input.modifiers.ctrl || input.modifiers.command;
-                    (
-                        modifier && input.key_pressed(egui::Key::N), // 新規作成.
-                        modifier && input.key_pressed(egui::Key::O), // JSON読み込み.
-                        modifier && input.key_pressed(egui::Key::S), // JSON保存.
-                        modifier && input.key_pressed(egui::Key::P), // Copy Playdate Lua.
-                    )
-                })
-            };
+            ui.input(|input| {
+                let modifier = input.modifiers.ctrl || input.modifiers.command;
+                (
+                    modifier && input.key_pressed(egui::Key::N), // 新規作成.
+                    modifier && input.key_pressed(egui::Key::O), // JSON読み込み.
+                    modifier && input.key_pressed(egui::Key::S), // JSON保存.
+                    modifier && input.key_pressed(egui::Key::P), // Copy Playdate Lua.
+                )
+            });
         if native_new || shortcut_new {
             self.begin_new_document();
         }
@@ -1703,7 +1983,7 @@ impl eframe::App for DotStrokeApp {
         if native_save || shortcut_save {
             self.save_json_document();
         }
-        if native_copy_playdate_lua || shortcut_copy_playdate_lua {
+        if shortcut_copy_playdate_lua {
             ui.ctx().copy_text(self.playdate_lua());
             self.status = "Copied Playdate Lua".into();
         }
@@ -1720,11 +2000,6 @@ impl eframe::App for DotStrokeApp {
                     }
                     if ui.button("Save JSON    Cmd+S").clicked() {
                         self.save_json_document();
-                        ui.close();
-                    }
-                    if ui.button("Copy Playdate Lua    Cmd+P").clicked() {
-                        ui.ctx().copy_text(self.playdate_lua());
-                        self.status = "Copied Playdate Lua".into();
                         ui.close();
                     }
                 });
@@ -1764,21 +2039,22 @@ impl eframe::App for DotStrokeApp {
                     "ellipse",
                     "path",
                 ] {
-                    if Self::tool_icon(ui, tool, self.tool == tool).clicked() {
+                    if Self::tool_icon(ui, tool, self.tool == tool, self.fill).clicked() {
                         self.tool = tool.into();
                     }
                 }
             });
+            ui.checkbox(&mut self.fill, "Fill closed shape");
             ui.label(format!("Selected: {}", self.tool));
             ui.separator();
             ui.label("Style");
-            egui::ComboBox::from_id_salt("color")
-                .selected_text(&self.color)
-                .show_ui(ui, |ui| {
-                    for c in ["black", "white", "clear"] {
-                        ui.selectable_value(&mut self.color, c.into(), c);
+            ui.horizontal(|ui| {
+                for color in ["black", "white", "clear"] {
+                    if Self::color_icon(ui, color, self.color == color).clicked() {
+                        self.color = color.into();
                     }
-                });
+                }
+            });
             let selected_dither = if self.tool == "select" {
                 self.selected
                     .and_then(|(layer_index, object_index)| {
@@ -1794,13 +2070,20 @@ impl eframe::App for DotStrokeApp {
             let mut dither_pattern = selected_dither.unwrap_or_else(|| self.dither_pattern.clone());
             let original_dither_pattern = dither_pattern.clone();
             ui.label("Dither pattern");
-            egui::ComboBox::from_id_salt("dither-pattern")
-                .selected_text(&dither_pattern)
-                .show_ui(ui, |ui| {
-                    for pattern in DITHER_PATTERNS {
-                        ui.selectable_value(&mut dither_pattern, pattern.into(), pattern);
+            ui.horizontal_wrapped(|ui| {
+                for pattern in DITHER_PATTERNS {
+                    if Self::dither_icon(
+                        ui,
+                        pattern,
+                        dither_pattern == pattern,
+                        self.dither_icons.get(pattern),
+                    )
+                    .clicked()
+                    {
+                        dither_pattern = pattern.into();
                     }
-                });
+                }
+            });
             let dither_changed = dither_pattern != original_dither_pattern;
             if dither_changed {
                 self.dither_pattern = dither_pattern.clone();
@@ -1820,7 +2103,6 @@ impl eframe::App for DotStrokeApp {
                 }
             }
             ui.add(egui::Slider::new(&mut self.width, 1..=8).text("Width"));
-            ui.checkbox(&mut self.fill, "Fill closed shape");
             if self.tool == "round_rect" {
                 ui.add(egui::Slider::new(&mut self.radius, 0..=16).text("Corner radius"));
             }
@@ -1877,6 +2159,10 @@ impl eframe::App for DotStrokeApp {
             .show(ui, |ui| {
                 ui.heading("1-bit Preview");
                 self.preview(ui);
+                if ui.button("Copy Playdate Lua").clicked() {
+                    ui.ctx().copy_text(self.playdate_lua());
+                    self.status = "Copied Playdate Lua".into();
+                }
                 ui.separator();
                 ui.heading("Vectors");
                 let vector_names: Vec<String> = self.doc.layers[self.current_layer]
@@ -1980,6 +2266,7 @@ fn main() -> eframe::Result {
         Box::new(move |_cc| {
             let mut app = DotStrokeApp::default();
             app.native_menu = native_menu;
+            app.load_dither_icons(&_cc.egui_ctx);
             Ok(Box::new(app))
         }),
     )
