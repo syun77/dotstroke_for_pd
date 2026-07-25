@@ -1293,6 +1293,88 @@ impl DotStrokeApp {
         response.on_hover_text(color)
     }
 
+    fn vector_row_icon(ui: &mut egui::Ui, object: &VectorObject, selected: bool) {
+        let size = Vec2::splat(18.0);
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        let painter = ui.painter_at(rect);
+        let fill = if selected {
+            ui.visuals().selection.bg_fill
+        } else {
+            ui.visuals().faint_bg_color
+        };
+        painter.rect_filled(rect, 3.0, fill);
+
+        let left = rect.left() + 4.0;
+        let right = rect.right() - 4.0;
+        let top = rect.top() + 4.0;
+        let bottom = rect.bottom() - 4.0;
+        let center = rect.center();
+        let stroke_color = if selected {
+            ui.visuals().selection.stroke.color
+        } else {
+            ui.visuals().widgets.inactive.fg_stroke.color
+        };
+        let stroke = Stroke::new(1.3, stroke_color);
+
+        match object.kind.as_str() {
+            "pixel" => {
+                painter.circle_filled(center, 2.4, stroke_color);
+            }
+            "rect" => {
+                let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+                if object.style.fill {
+                    painter.rect_filled(bounds, 0.0, stroke_color);
+                }
+                painter.rect_stroke(bounds, 0.0, stroke, egui::StrokeKind::Inside);
+            }
+            "round_rect" => {
+                let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+                let radius = 2.5;
+                if object.style.fill {
+                    painter.rect_filled(bounds, radius, stroke_color);
+                }
+                painter.rect_stroke(bounds, radius, stroke, egui::StrokeKind::Inside);
+            }
+            "ellipse" => {
+                let radii = Vec2::new((right - left) / 2.0, (bottom - top) / 2.0);
+                if object.style.fill {
+                    painter.add(egui::Shape::ellipse_filled(center, radii, stroke_color));
+                }
+                painter.add(egui::Shape::ellipse_stroke(center, radii, stroke));
+            }
+            "polygon" => {
+                let points = vec![
+                    Pos2::new(center.x, top),
+                    Pos2::new(right, center.y + 1.0),
+                    Pos2::new(center.x + 2.0, bottom),
+                    Pos2::new(left, center.y + 1.0),
+                ];
+                if object.style.fill {
+                    painter.add(egui::Shape::convex_polygon(
+                        points.clone(),
+                        stroke_color,
+                        stroke,
+                    ));
+                } else {
+                    painter.add(egui::Shape::closed_line(points, stroke));
+                }
+            }
+            _ => {
+                let points = vec![
+                    Pos2::new(left, bottom),
+                    Pos2::new(center.x - 1.0, top + 1.0),
+                    Pos2::new(right, center.y + 1.0),
+                ];
+                for pair in points.windows(2) {
+                    painter.line_segment([pair[0], pair[1]], stroke);
+                }
+                if object.closed {
+                    painter.line_segment([*points.last().unwrap(), points[0]], stroke);
+                }
+            }
+        }
+    }
+
     fn dither_icon(
         ui: &mut egui::Ui,
         pattern: &str,
@@ -2492,15 +2574,25 @@ impl eframe::App for DotStrokeApp {
                 }
                 ui.separator();
                 ui.heading("Vectors");
-                let vector_names: Vec<String> = self.doc.layers[self.current_layer]
+                let vector_rows: Vec<(usize, String, VectorObject)> = self.doc.layers
+                    [self.current_layer]
                     .objects
                     .iter()
                     .enumerate()
-                    .map(|(index, object)| format!("{}: {}", index + 1, object.kind))
+                    .map(|(index, object)| {
+                        (index, format!("{}: {}", index + 1, object.kind), object.clone())
+                    })
                     .collect();
-                for (index, name) in vector_names.iter().enumerate() {
+                for (index, name, object) in vector_rows {
                     let is_selected = self.selected == Some((self.current_layer, index));
-                    if ui.selectable_label(is_selected, name).clicked() {
+                    let mut clicked = false;
+                    ui.horizontal(|ui| {
+                        Self::vector_row_icon(ui, &object, is_selected);
+                        if ui.selectable_label(is_selected, name).clicked() {
+                            clicked = true;
+                        }
+                    });
+                    if clicked {
                         self.selected = Some((self.current_layer, index));
                         self.selected_point = None;
                         self.tool = "select".into();
