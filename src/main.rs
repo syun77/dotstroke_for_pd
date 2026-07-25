@@ -2497,14 +2497,7 @@ impl eframe::App for DotStrokeApp {
             ui.label(format!("Selected: {}", self.current_tool_label()));
             ui.separator();
             ui.label("Style");
-            ui.horizontal(|ui| {
-                for color in ["black", "white", "clear"] {
-                    if Self::color_icon(ui, color, self.color == color).clicked() {
-                        self.color = color.into();
-                    }
-                }
-            });
-            let selected_blend = if self.tool == "select" {
+            let selected_style = if self.tool == "select" {
                 self.selected
                     .and_then(|(layer_index, object_index)| {
                         self.doc
@@ -2512,11 +2505,57 @@ impl eframe::App for DotStrokeApp {
                             .get(layer_index)
                             .and_then(|layer| layer.objects.get(object_index))
                     })
-                    .map(|object| object.style.blend.clone())
+                    .map(|object| object.style.clone())
             } else {
                 None
             };
-            let mut blend = selected_blend.unwrap_or_else(|| self.blend.clone());
+            let selected_kind = if self.tool == "select" {
+                self.selected
+                    .and_then(|(layer_index, object_index)| {
+                        self.doc
+                            .layers
+                            .get(layer_index)
+                            .and_then(|layer| layer.objects.get(object_index))
+                    })
+                    .map(|object| object.kind.clone())
+            } else {
+                None
+            };
+            let mut color = selected_style
+                .as_ref()
+                .map(|style| style.color.clone())
+                .unwrap_or_else(|| self.color.clone());
+            let original_color = color.clone();
+            ui.horizontal(|ui| {
+                for color_name in ["black", "white", "clear"] {
+                    if Self::color_icon(ui, color_name, color == color_name).clicked() {
+                        color = color_name.into();
+                    }
+                }
+            });
+            let color_changed = color != original_color;
+            if color_changed {
+                self.color = color.clone();
+                if let Some((layer_index, object_index)) = self.selected {
+                    if self.tool == "select" {
+                        self.save_history();
+                        if let Some(object) = self
+                            .doc
+                            .layers
+                            .get_mut(layer_index)
+                            .and_then(|layer| layer.objects.get_mut(object_index))
+                        {
+                            object.style.color = color;
+                            self.status = "Color changed".into();
+                        }
+                    }
+                }
+            }
+
+            let mut blend = selected_style
+                .as_ref()
+                .map(|style| style.blend.clone())
+                .unwrap_or_else(|| self.blend.clone());
             let original_blend = blend.clone();
             ui.horizontal(|ui| {
                 ui.label("Blend");
@@ -2541,19 +2580,10 @@ impl eframe::App for DotStrokeApp {
                     }
                 }
             }
-            let selected_dither = if self.tool == "select" {
-                self.selected
-                    .and_then(|(layer_index, object_index)| {
-                        self.doc
-                            .layers
-                            .get(layer_index)
-                            .and_then(|layer| layer.objects.get(object_index))
-                    })
-                    .map(|object| object.style.dither_pattern.clone())
-            } else {
-                None
-            };
-            let mut dither_pattern = selected_dither.unwrap_or_else(|| self.dither_pattern.clone());
+            let mut dither_pattern = selected_style
+                .as_ref()
+                .map(|style| style.dither_pattern.clone())
+                .unwrap_or_else(|| self.dither_pattern.clone());
             let original_dither_pattern = dither_pattern.clone();
             ui.label("Dither pattern");
             ui.horizontal_wrapped(|ui| {
@@ -2588,9 +2618,60 @@ impl eframe::App for DotStrokeApp {
                     }
                 }
             }
-            ui.add(egui::Slider::new(&mut self.width, 1..=8).text("Width"));
-            if matches!(self.tool.as_str(), "round_rect" | "fill_round_rect") {
-                ui.add(egui::Slider::new(&mut self.radius, 0..=16).text("Corner radius"));
+            let mut width = selected_style
+                .as_ref()
+                .map_or(self.width, |style| style.width);
+            let width_response = ui.add(egui::Slider::new(&mut width, 1..=8).text("Width"));
+            if width_response.changed() {
+                self.width = width;
+                if self.tool == "select" {
+                    if let Some((layer_index, object_index)) = self.selected {
+                        self.save_history();
+                        if let Some(object) = self
+                            .doc
+                            .layers
+                            .get_mut(layer_index)
+                            .and_then(|layer| layer.objects.get_mut(object_index))
+                        {
+                            object.style.width = width;
+                            self.status = "Width changed".into();
+                        }
+                    }
+                }
+            } else if self.tool != "select" {
+                self.width = width;
+            }
+
+            if matches!(self.tool.as_str(), "round_rect" | "fill_round_rect")
+                || selected_style
+                    .as_ref()
+                    .is_some()
+                    && matches!(selected_kind.as_deref(), Some("round_rect"))
+            {
+                let mut radius = selected_style
+                    .as_ref()
+                    .map_or(self.radius, |style| style.radius);
+                let radius_response =
+                    ui.add(egui::Slider::new(&mut radius, 0..=16).text("Corner radius"));
+                if radius_response.changed() {
+                    self.radius = radius;
+                    if self.tool == "select" {
+                        if let Some((layer_index, object_index)) = self.selected {
+                            self.save_history();
+                            if let Some(object) = self
+                                .doc
+                                .layers
+                                .get_mut(layer_index)
+                                .and_then(|layer| layer.objects.get_mut(object_index))
+                            {
+                                object.style.radius = radius;
+                                self.status = "Corner radius changed".into();
+                            }
+                        }
+                    }
+                } else if self.tool != "select" {
+                    self.radius = radius;
+                }
             }
             egui::ComboBox::from_id_salt("rounding")
                 .selected_text(&self.rounding)
