@@ -1,5 +1,14 @@
 use eframe::egui::Color32;
 
+pub mod interaction {
+    // 制御点の通常表示半径
+    pub const CONTROL_POINT_RADIUS: f32 = 4.0;
+    // 制御点ホバー時の表示半径
+    pub const CONTROL_POINT_HOVER_RADIUS: f32 = 9.0;
+    // 制御点のホバー/ドラッグ判定半径の上限（大きめに設定）
+    pub const CONTROL_POINT_HIT_RADIUS: f32 = 40.0;
+}
+
 pub mod colors {
     use super::Color32;
 

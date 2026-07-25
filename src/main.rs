@@ -16,9 +16,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const CONTROL_POINT_RADIUS: f32 = 4.0;
-const CONTROL_POINT_HOVER_RADIUS: f32 = 7.0;
-const CONTROL_POINT_HIT_RADIUS: f32 = 24.0;
 const DITHER_PATTERNS: [&str; 11] = [
     "none",
     "diagonal_line",
@@ -315,7 +312,7 @@ impl DotStrokeApp {
             .get(layer_index)?
             .objects
             .get(object_index)?;
-        let hit_radius = editor::hit_radius(rect, self.zoom).min(CONTROL_POINT_HIT_RADIUS);
+        let hit_radius = config::interaction::CONTROL_POINT_HIT_RADIUS;
         object
             .points
             .iter()
@@ -1848,9 +1845,9 @@ impl DotStrokeApp {
                                 let is_hovered =
                                     hovered_control_point == Some(point_index) || is_dragging_point;
                                 let radius = if is_hovered {
-                                    CONTROL_POINT_HOVER_RADIUS
+                                    config::interaction::CONTROL_POINT_HOVER_RADIUS
                                 } else {
-                                    CONTROL_POINT_RADIUS
+                                    config::interaction::CONTROL_POINT_RADIUS
                                 };
                                 if is_hovered {
                                     painter.circle_filled(
@@ -1910,9 +1907,9 @@ impl DotStrokeApp {
                         let is_hovered =
                             hovered_control_point == Some(point_index) || is_dragging_point;
                         let radius = if is_hovered {
-                            CONTROL_POINT_HOVER_RADIUS
+                            config::interaction::CONTROL_POINT_HOVER_RADIUS
                         } else {
-                            CONTROL_POINT_RADIUS
+                            config::interaction::CONTROL_POINT_RADIUS
                         };
                         if is_hovered {
                             painter.circle_filled(
@@ -1991,9 +1988,13 @@ impl DotStrokeApp {
         {
             if self.selected.is_some() {
                 if response.drag_started() {
-                    // The expanded hover state is the source of truth for which
-                    // control point is movable; do not use a separate drag hit test.
-                    self.selected_point = hovered_control_point;
+                    // Lock drag target from the initial press position so point drag
+                    // consistently moves only that point.
+                    let drag_start = ui
+                        .input(|input| input.pointer.press_origin())
+                        .or_else(|| response.interact_pointer_pos());
+                    self.selected_point = drag_start
+                        .and_then(|position| self.hit_test_control_point(rect, position));
                     self.save_history();
                 }
                 let delta = ui.input(|i| i.pointer.delta()) / self.zoom;
@@ -2331,6 +2332,79 @@ impl eframe::App for DotStrokeApp {
                         self.duplicate_selected();
                     }
                 });
+
+                ui.separator();
+                ui.heading("Control Points");
+                let selected_points = self
+                    .selected
+                    .and_then(|(layer_index, object_index)| {
+                        self.doc
+                            .layers
+                            .get(layer_index)
+                            .and_then(|layer| layer.objects.get(object_index))
+                    })
+                    .map(|object| object.points.clone());
+
+                let mut point_edits: Vec<(usize, [f32; 2])> = Vec::new();
+                if let Some(points) = selected_points {
+                    if points.is_empty() {
+                        ui.label("制御点がありません");
+                    } else {
+                        for (index, point) in points.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let is_selected_point = self.selected_point == Some(index);
+                                if ui
+                                    .selectable_label(is_selected_point, format!("P{}", index + 1))
+                                    .clicked()
+                                {
+                                    self.selected_point = Some(index);
+                                    self.tool = "select".into();
+                                }
+
+                                let mut x = point[0];
+                                let mut y = point[1];
+                                let x_changed = ui
+                                    .add(
+                                        egui::DragValue::new(&mut x)
+                                            .speed(0.1)
+                                            .prefix("x: "),
+                                    )
+                                    .changed();
+                                let y_changed = ui
+                                    .add(
+                                        egui::DragValue::new(&mut y)
+                                            .speed(0.1)
+                                            .prefix("y: "),
+                                    )
+                                    .changed();
+                                if x_changed || y_changed {
+                                    point_edits.push((index, [x, y]));
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    ui.label("ベクターを選択してください");
+                }
+
+                if !point_edits.is_empty() {
+                    self.save_history();
+                    if let Some((layer_index, object_index)) = self.selected {
+                        if let Some(object) = self
+                            .doc
+                            .layers
+                            .get_mut(layer_index)
+                            .and_then(|layer| layer.objects.get_mut(object_index))
+                        {
+                            for (index, point) in point_edits {
+                                if let Some(target) = object.points.get_mut(index) {
+                                    *target = point;
+                                }
+                            }
+                            self.status = "Control point updated".into();
+                        }
+                    }
+                }
             });
         egui::containers::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {

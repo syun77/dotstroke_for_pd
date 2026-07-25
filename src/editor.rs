@@ -1,5 +1,5 @@
 use crate::model::{Document, VectorObject};
-use eframe::egui::{Pos2, Rect, Vec2};
+use eframe::egui::{Pos2, Vec2};
 
 pub struct History {
     undo: Vec<Document>,
@@ -67,8 +67,4 @@ pub fn move_object(object: &mut VectorObject, delta: Vec2) {
         point[0] += delta.x;
         point[1] += delta.y;
     }
-}
-pub fn hit_radius(rect: Rect, zoom: f32) -> f32 {
-    let _ = rect;
-    24.0 / zoom
 }
