@@ -1,5 +1,9 @@
 use eframe::egui::Color32;
+// =======================================================
+// パラメータ設定ファイル.
+// =======================================================
 
+// ■操作関連.
 pub mod interaction {
     // 制御点の通常表示半径
     pub const CONTROL_POINT_RADIUS: f32 = 4.0;
@@ -9,6 +13,7 @@ pub mod interaction {
     pub const CONTROL_POINT_HIT_RADIUS: f32 = 40.0;
 }
 
+// ■色関連.
 pub mod colors {
     use super::Color32;
 

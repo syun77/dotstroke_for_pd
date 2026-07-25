@@ -35,10 +35,12 @@ struct DotStrokeApp {
     doc: Document,
     tool: String,
     color: String,
+    blend: String,
     width: i32,
     radius: i32,
     dither_pattern: String,
     rounding: String,
+    use_global_export_params: bool,
     pixel_preview: bool,
     zoom: f32,
     pan: Vec2,
@@ -64,10 +66,12 @@ impl Default for DotStrokeApp {
             doc: Document::default(),
             tool: "line".into(),
             color: "black".into(),
+            blend: "normal".into(),
             width: 1,
             radius: 4,
             dither_pattern: "none".into(),
             rounding: "nearest".into(),
+            use_global_export_params: false,
             pixel_preview: false,
             zoom: 2.0,
             pan: Vec2::ZERO,
@@ -412,6 +416,7 @@ impl DotStrokeApp {
             closed,
             style: Style {
                 color: self.color.clone(),
+                blend: self.blend.clone(),
                 width: self.width,
                 fill: tool_fill,
                 radius: self.radius,
@@ -432,7 +437,124 @@ impl DotStrokeApp {
         export::lua_cap_style(cap)
     }
 
-    fn append_lua_object(output: &mut String, object: &VectorObject) {
+    fn lua_style_fields(object: &VectorObject) -> Vec<String> {
+        let mut fields = vec![
+            format!(
+                "color = {}",
+                export::lua_color_with_blend(&object.style.color, &object.style.blend)
+            ),
+            format!("blend = \"{}\"", object.style.blend),
+            format!("width = {}", object.style.width.max(1)),
+            format!("cap = {}", Self::lua_cap_style(&object.style.cap)),
+            format!("fill = {}", if object.style.fill { "true" } else { "false" }),
+            format!("radius = {}", object.style.radius.max(0)),
+        ];
+        if let Some(pattern) = export::lua_dither_pattern(&object.style.dither_pattern) {
+            fields.push(format!("ditherPattern = {}", pattern));
+        }
+        fields
+    }
+
+    fn append_lua_object_with_global_params(output: &mut String, object: &VectorObject) {
+        if !object.visible || object.points.is_empty() {
+            return;
+        }
+
+        let style_fields = Self::lua_style_fields(object).join(", ");
+
+        match object.kind.as_str() {
+            "pixel" => {
+                let _ = writeln!(
+                    output,
+                    "drawPrimitive(\"pixel\", {{ x = {}, y = {} }}, {{ {} }})",
+                    Self::lua_number(object.points[0][0]),
+                    Self::lua_number(object.points[0][1]),
+                    style_fields
+                );
+            }
+            "rect" if object.points.len() >= 2 => {
+                let x = object.points[0][0].min(object.points[1][0]);
+                let y = object.points[0][1].min(object.points[1][1]);
+                let width = (object.points[0][0] - object.points[1][0]).abs();
+                let height = (object.points[0][1] - object.points[1][1]).abs();
+                let _ = writeln!(
+                    output,
+                    "drawPrimitive(\"rect\", {{ x = {}, y = {}, width = {}, height = {} }}, {{ {} }})",
+                    Self::lua_number(x),
+                    Self::lua_number(y),
+                    Self::lua_number(width),
+                    Self::lua_number(height),
+                    style_fields
+                );
+            }
+            "round_rect" if object.points.len() >= 2 => {
+                let x = object.points[0][0].min(object.points[1][0]);
+                let y = object.points[0][1].min(object.points[1][1]);
+                let width = (object.points[0][0] - object.points[1][0]).abs();
+                let height = (object.points[0][1] - object.points[1][1]).abs();
+                let _ = writeln!(
+                    output,
+                    "drawPrimitive(\"round_rect\", {{ x = {}, y = {}, width = {}, height = {} }}, {{ {} }})",
+                    Self::lua_number(x),
+                    Self::lua_number(y),
+                    Self::lua_number(width),
+                    Self::lua_number(height),
+                    style_fields
+                );
+            }
+            "ellipse" if object.points.len() >= 2 => {
+                let x = object.points[0][0].min(object.points[1][0]);
+                let y = object.points[0][1].min(object.points[1][1]);
+                let width = (object.points[0][0] - object.points[1][0]).abs();
+                let height = (object.points[0][1] - object.points[1][1]).abs();
+                let _ = writeln!(
+                    output,
+                    "drawPrimitive(\"ellipse\", {{ x = {}, y = {}, width = {}, height = {} }}, {{ {} }})",
+                    Self::lua_number(x),
+                    Self::lua_number(y),
+                    Self::lua_number(width),
+                    Self::lua_number(height),
+                    style_fields
+                );
+            }
+            "polygon" if object.points.len() >= 3 => {
+                let points = object
+                    .points
+                    .iter()
+                    .flat_map(|p| [Self::lua_number(p[0]), Self::lua_number(p[1])])
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    output,
+                    "drawPrimitive(\"polygon\", {{ points = {{ {} }} }}, {{ {} }})",
+                    points,
+                    style_fields
+                );
+            }
+            "line" | "polyline" | "path" if object.points.len() >= 2 => {
+                let points = object
+                    .points
+                    .iter()
+                    .flat_map(|p| [Self::lua_number(p[0]), Self::lua_number(p[1])])
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    output,
+                    "drawPrimitive(\"path\", {{ points = {{ {} }}, closed = {} }}, {{ {} }})",
+                    points,
+                    if object.closed { "true" } else { "false" },
+                    style_fields
+                );
+            }
+            _ => {}
+        }
+
+        for child in &object.children {
+            Self::append_lua_object_with_global_params(output, child);
+        }
+    }
+
+    fn append_lua_object_simple(output: &mut String, object: &VectorObject) {
         if !object.visible || object.points.is_empty() {
             return;
         }
@@ -443,7 +565,7 @@ impl DotStrokeApp {
         let _ = writeln!(
             output,
             "gfx.setColor({})",
-            export::lua_color(&object.style.color)
+            export::lua_color_with_blend(&object.style.color, &object.style.blend)
         );
         if let Some(pattern) = export::lua_dither_pattern(&object.style.dither_pattern) {
             let _ = writeln!(output, "gfx.setDitherPattern(0.5, {})", pattern);
@@ -569,16 +691,26 @@ impl DotStrokeApp {
         }
 
         for child in &object.children {
-            Self::append_lua_object(output, child);
+            Self::append_lua_object_simple(output, child);
         }
     }
 
     fn playdate_lua(&self) -> String {
-        let mut output = String::from("local gfx <const> = playdate.graphics\n");
+        let mut output = if self.use_global_export_params {
+            String::from(
+                "local gfx <const> = playdate.graphics\n\nlocal function drawPrimitive(kind, params, style)\n    params = params or {}\n    style = style or {}\n\n    if style.blend == \"xor\" then\n        gfx.setColor(gfx.kColorXOR)\n    else\n        gfx.setColor(style.color or gfx.kColorBlack)\n    end\n    if style.ditherPattern then\n        gfx.setDitherPattern(0.5, style.ditherPattern)\n    end\n\n    local lineWidth = style.width or 1\n    local lineCap = style.cap or gfx.kLineCapStyleButt\n\n    if kind == \"pixel\" then\n        gfx.drawPixel(params.x or 0, params.y or 0)\n    elseif kind == \"rect\" then\n        gfx.setLineWidth(lineWidth)\n        if style.fill then\n            gfx.fillRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0)\n        else\n            gfx.drawRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0)\n        end\n    elseif kind == \"round_rect\" then\n        gfx.setLineWidth(lineWidth)\n        local radius = style.radius or 0\n        if style.fill then\n            gfx.fillRoundRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0, radius)\n        else\n            gfx.drawRoundRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0, radius)\n        end\n    elseif kind == \"ellipse\" then\n        gfx.setLineWidth(lineWidth)\n        if style.fill then\n            gfx.fillEllipseInRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0)\n        else\n            gfx.drawEllipseInRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0)\n        end\n    elseif kind == \"polygon\" then\n        local points = params.points or {}\n        gfx.setLineWidth(lineWidth)\n        gfx.setLineCapStyle(lineCap)\n        if style.fill then\n            gfx.fillPolygon(table.unpack(points))\n        end\n        gfx.drawPolygon(table.unpack(points))\n    elseif kind == \"path\" then\n        local points = params.points or {}\n        gfx.setLineWidth(lineWidth)\n        gfx.setLineCapStyle(lineCap)\n        for i = 1, #points - 2, 2 do\n            gfx.drawLine(points[i], points[i + 1], points[i + 2], points[i + 3])\n        end\n        if params.closed and #points > 4 then\n            gfx.drawLine(points[#points - 1], points[#points], points[1], points[2])\n        end\n    end\nend\n\n",
+            )
+        } else {
+            String::from("local gfx <const> = playdate.graphics\n")
+        };
         for layer in &self.doc.layers {
             if layer.visible {
                 for object in &layer.objects {
-                    Self::append_lua_object(&mut output, object);
+                    if self.use_global_export_params {
+                        Self::append_lua_object_with_global_params(&mut output, object);
+                    } else {
+                        Self::append_lua_object_simple(&mut output, object);
+                    }
                 }
             }
         }
@@ -1318,6 +1450,18 @@ impl DotStrokeApp {
         response.on_hover_text(pattern)
     }
 
+    fn apply_raster_blend_color(current: Color32, color: Color32, blend: &str) -> Color32 {
+        if blend == "xor" {
+            if current == Color32::BLACK {
+                Color32::WHITE
+            } else {
+                Color32::BLACK
+            }
+        } else {
+            color
+        }
+    }
+
     fn put_raster_pixel(
         pixels: &mut [Color32],
         width: usize,
@@ -1325,6 +1469,7 @@ impl DotStrokeApp {
         x: i32,
         y: i32,
         color: Color32,
+        blend: &str,
         line_width: f32,
         dither_pattern: &str,
     ) {
@@ -1338,7 +1483,9 @@ impl DotStrokeApp {
                 let py = y + dy;
                 if px >= 0 && py >= 0 && (px as usize) < width && (py as usize) < height {
                     if Self::dither_allows_pixel(dither_pattern, px as usize, py as usize) {
-                        pixels[py as usize * width + px as usize] = color;
+                        let index = py as usize * width + px as usize;
+                        pixels[index] =
+                            Self::apply_raster_blend_color(pixels[index], color, blend);
                     }
                 }
             }
@@ -1389,6 +1536,7 @@ impl DotStrokeApp {
         start: Pos2,
         end: Pos2,
         color: Color32,
+        blend: &str,
         line_width: f32,
         dither_pattern: &str,
     ) {
@@ -1410,6 +1558,7 @@ impl DotStrokeApp {
                 x0,
                 y0,
                 color,
+                blend,
                 line_width,
                 dither_pattern,
             );
@@ -1434,6 +1583,7 @@ impl DotStrokeApp {
         height: usize,
         bounds: [f32; 4],
         color: Color32,
+        blend: &str,
         line_width: f32,
         dither_pattern: &str,
     ) {
@@ -1465,6 +1615,7 @@ impl DotStrokeApp {
                     px,
                     py,
                     color,
+                    blend,
                     line_width,
                     dither_pattern,
                 );
@@ -1495,6 +1646,7 @@ impl DotStrokeApp {
                     px,
                     py,
                     color,
+                    blend,
                     line_width,
                     dither_pattern,
                 );
@@ -1540,6 +1692,7 @@ impl DotStrokeApp {
                     pair[0],
                     pair[1],
                     color,
+                    &object.style.blend,
                     stroke_width,
                     &object.style.dither_pattern,
                 );
@@ -1552,6 +1705,7 @@ impl DotStrokeApp {
                     *points.last().unwrap(),
                     points[0],
                     color,
+                    &object.style.blend,
                     stroke_width,
                     &object.style.dither_pattern,
                 );
@@ -1568,6 +1722,7 @@ impl DotStrokeApp {
                 height,
                 [points[0].x, points[0].y, points[1].x, points[1].y],
                 color,
+                &object.style.blend,
                 stroke_width,
                 &object.style.dither_pattern,
             );
@@ -1617,6 +1772,7 @@ impl DotStrokeApp {
                     *start,
                     *end,
                     color,
+                    &object.style.blend,
                     stroke_width,
                     &object.style.dither_pattern,
                 );
@@ -1716,7 +1872,12 @@ impl DotStrokeApp {
                 };
                 if drawn {
                     if Self::dither_allows_pixel(&object.style.dither_pattern, x, y) {
-                        pixels[y * width + x] = color;
+                        let index = y * width + x;
+                        pixels[index] = Self::apply_raster_blend_color(
+                            pixels[index],
+                            color,
+                            &object.style.blend,
+                        );
                     }
                 }
             }
@@ -2201,6 +2362,43 @@ impl eframe::App for DotStrokeApp {
                     }
                 }
             });
+            let selected_blend = if self.tool == "select" {
+                self.selected
+                    .and_then(|(layer_index, object_index)| {
+                        self.doc
+                            .layers
+                            .get(layer_index)
+                            .and_then(|layer| layer.objects.get(object_index))
+                    })
+                    .map(|object| object.style.blend.clone())
+            } else {
+                None
+            };
+            let mut blend = selected_blend.unwrap_or_else(|| self.blend.clone());
+            let original_blend = blend.clone();
+            ui.horizontal(|ui| {
+                ui.label("Blend");
+                ui.selectable_value(&mut blend, "normal".into(), "Normal");
+                ui.selectable_value(&mut blend, "xor".into(), "XOR");
+            });
+            let blend_changed = blend != original_blend;
+            if blend_changed {
+                self.blend = blend.clone();
+                if self.tool == "select" {
+                    if let Some((layer_index, object_index)) = self.selected {
+                        self.save_history();
+                        if let Some(object) = self
+                            .doc
+                            .layers
+                            .get_mut(layer_index)
+                            .and_then(|layer| layer.objects.get_mut(object_index))
+                        {
+                            object.style.blend = blend;
+                            self.status = "Blend mode changed".into();
+                        }
+                    }
+                }
+            }
             let selected_dither = if self.tool == "select" {
                 self.selected
                     .and_then(|(layer_index, object_index)| {
@@ -2260,33 +2458,17 @@ impl eframe::App for DotStrokeApp {
                     }
                 });
             ui.separator();
-            ui.label(format!("Zoom: {:.2}x", self.zoom));
-            ui.horizontal(|ui| {
-                if ui.button("-").clicked() {
-                    self.zoom = (self.zoom - 0.25).max(0.25);
-                }
-                if ui.button("+").clicked() {
-                    self.zoom = (self.zoom + 0.25).min(self.max_zoom());
-                }
-                if ui.button("Reset").clicked() {
-                    self.zoom = 2.0;
-                    self.pan = Vec2::ZERO;
-                }
-            });
+            ui.label("Export");
+            ui.checkbox(
+                &mut self.use_global_export_params,
+                "Enable global params (drawPrimitive)",
+            );
             if ui.button("Finalize").clicked() {
                 self.commit_pending(self.current_tool_kind() == "polygon");
             }
             if ui.button("Cancel").clicked() {
                 self.pending.clear();
             }
-            ui.horizontal(|ui| {
-                if ui.button("Undo").clicked() {
-                    self.undo_document();
-                }
-                if ui.button("Redo").clicked() {
-                    self.redo_document();
-                }
-            });
             ui.separator();
             ui.separator();
             ui.label(&self.status);
@@ -2408,6 +2590,25 @@ impl eframe::App for DotStrokeApp {
             });
         egui::containers::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
+                    if ui.button("Undo").clicked() {
+                        self.undo_document();
+                    }
+                    if ui.button("Redo").clicked() {
+                        self.redo_document();
+                    }
+                    ui.separator();
+                    ui.label(format!("Zoom: {:.2}x", self.zoom));
+                    if ui.button("-").clicked() {
+                        self.zoom = (self.zoom - 0.25).max(0.25);
+                    }
+                    if ui.button("+").clicked() {
+                        self.zoom = (self.zoom + 0.25).min(self.max_zoom());
+                    }
+                    if ui.button("Reset").clicked() {
+                        self.zoom = 2.0;
+                        self.pan = Vec2::ZERO;
+                    }
+                    ui.separator();
                 ui.checkbox(&mut self.pixel_preview, "Pixel preview");
             });
             ui.separator();

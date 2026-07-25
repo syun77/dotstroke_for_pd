@@ -13,6 +13,15 @@ pub fn lua_color(color: &str) -> &'static str {
         _ => "gfx.kColorBlack",
     }
 }
+
+pub fn lua_color_with_blend(color: &str, blend: &str) -> &'static str {
+    if blend == "xor" {
+        "gfx.kColorXOR"
+    } else {
+        lua_color(color)
+    }
+}
+
 pub fn lua_cap_style(cap: &str) -> &'static str {
     match cap {
         "round" => "gfx.kLineCapStyleRound",
