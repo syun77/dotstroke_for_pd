@@ -1297,80 +1297,140 @@ impl DotStrokeApp {
         let size = Vec2::splat(18.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let painter = ui.painter_at(rect);
-        let fill = if selected {
-            ui.visuals().selection.bg_fill
-        } else {
-            ui.visuals().faint_bg_color
-        };
-        painter.rect_filled(rect, 3.0, fill);
+        painter.rect_filled(rect, 3.0, ui.visuals().faint_bg_color);
+        if selected {
+            painter.rect_stroke(
+                rect,
+                3.0,
+                ui.visuals().selection.stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
 
-        let left = rect.left() + 4.0;
-        let right = rect.right() - 4.0;
-        let top = rect.top() + 4.0;
-        let bottom = rect.bottom() - 4.0;
-        let center = rect.center();
-        let stroke_color = if selected {
-            ui.visuals().selection.stroke.color
-        } else {
-            ui.visuals().widgets.inactive.fg_stroke.color
+        if object.points.is_empty() {
+            return;
+        }
+
+        let preview = rect.shrink(3.0);
+        if preview.width() <= 0.0 || preview.height() <= 0.0 {
+            return;
+        }
+
+        let (source_min_x, source_max_x, source_min_y, source_max_y) =
+            if matches!(object.kind.as_str(), "rect" | "round_rect" | "ellipse")
+                && object.points.len() >= 2
+            {
+                (
+                    object.points[0][0].min(object.points[1][0]),
+                    object.points[0][0].max(object.points[1][0]),
+                    object.points[0][1].min(object.points[1][1]),
+                    object.points[0][1].max(object.points[1][1]),
+                )
+            } else {
+                (
+                    object
+                        .points
+                        .iter()
+                        .map(|point| point[0])
+                        .fold(f32::INFINITY, f32::min),
+                    object
+                        .points
+                        .iter()
+                        .map(|point| point[0])
+                        .fold(f32::NEG_INFINITY, f32::max),
+                    object
+                        .points
+                        .iter()
+                        .map(|point| point[1])
+                        .fold(f32::INFINITY, f32::min),
+                    object
+                        .points
+                        .iter()
+                        .map(|point| point[1])
+                        .fold(f32::NEG_INFINITY, f32::max),
+                )
+            };
+
+        let source_w = (source_max_x - source_min_x).max(1.0);
+        let source_h = (source_max_y - source_min_y).max(1.0);
+        let scale = (preview.width() / source_w)
+            .min(preview.height() / source_h)
+            .max(0.001);
+        let mapped_w = source_w * scale;
+        let mapped_h = source_h * scale;
+        let origin_x = preview.left() + (preview.width() - mapped_w) * 0.5;
+        let origin_y = preview.top() + (preview.height() - mapped_h) * 0.5;
+
+        let map = |point: [f32; 2]| {
+            Pos2::new(
+                origin_x + (point[0] - source_min_x) * scale,
+                origin_y + (point[1] - source_min_y) * scale,
+            )
         };
-        let stroke = Stroke::new(1.3, stroke_color);
+
+        let points: Vec<Pos2> = object.points.iter().copied().map(map).collect();
+        let (draw_color, background_color) = match object.style.color.as_str() {
+            "white" => (Color32::WHITE, Color32::BLACK),
+            "clear" => (config::colors::clear_color(), Color32::BLACK),
+            _ => (Color32::BLACK, Color32::WHITE),
+        };
+        painter.rect_filled(preview, 1.0, background_color);
+        painter.rect_stroke(
+            preview,
+            1.0,
+            Stroke::new(0.7, Color32::GRAY),
+            egui::StrokeKind::Inside,
+        );
+        let stroke_color = draw_color;
+        let stroke = Stroke::new((object.style.width.max(1) as f32 * 0.45).clamp(0.9, 1.8), stroke_color);
 
         match object.kind.as_str() {
             "pixel" => {
-                painter.circle_filled(center, 2.4, stroke_color);
+                painter.circle_filled(points[0], 1.8, draw_color);
             }
-            "rect" => {
-                let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+            "rect" if points.len() >= 2 => {
+                let bounds = Rect::from_two_pos(points[0], points[1]);
                 if object.style.fill {
-                    painter.rect_filled(bounds, 0.0, stroke_color);
+                    painter.rect_filled(bounds, 0.0, draw_color);
                 }
                 painter.rect_stroke(bounds, 0.0, stroke, egui::StrokeKind::Inside);
             }
-            "round_rect" => {
-                let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
-                let radius = 2.5;
+            "round_rect" if points.len() >= 2 => {
+                let bounds = Rect::from_two_pos(points[0], points[1]);
+                let radius = (object.style.radius.max(0) as f32 * scale)
+                    .clamp(0.0, bounds.width().min(bounds.height()) * 0.5);
                 if object.style.fill {
-                    painter.rect_filled(bounds, radius, stroke_color);
+                    painter.rect_filled(bounds, radius, draw_color);
                 }
                 painter.rect_stroke(bounds, radius, stroke, egui::StrokeKind::Inside);
             }
-            "ellipse" => {
-                let radii = Vec2::new((right - left) / 2.0, (bottom - top) / 2.0);
+            "ellipse" if points.len() >= 2 => {
+                let bounds = Rect::from_two_pos(points[0], points[1]);
+                let center = bounds.center();
+                let radii = Vec2::new(bounds.width() * 0.5, bounds.height() * 0.5);
                 if object.style.fill {
-                    painter.add(egui::Shape::ellipse_filled(center, radii, stroke_color));
+                    painter.add(egui::Shape::ellipse_filled(center, radii, draw_color));
                 }
                 painter.add(egui::Shape::ellipse_stroke(center, radii, stroke));
             }
-            "polygon" => {
-                let points = vec![
-                    Pos2::new(center.x, top),
-                    Pos2::new(right, center.y + 1.0),
-                    Pos2::new(center.x + 2.0, bottom),
-                    Pos2::new(left, center.y + 1.0),
-                ];
+            "polygon" if points.len() >= 3 => {
                 if object.style.fill {
-                    painter.add(egui::Shape::convex_polygon(
-                        points.clone(),
-                        stroke_color,
-                        stroke,
-                    ));
+                    painter.add(egui::Shape::convex_polygon(points.clone(), draw_color, stroke));
                 } else {
-                    painter.add(egui::Shape::closed_line(points, stroke));
+                    painter.add(egui::Shape::closed_line(points.clone(), stroke));
                 }
+                painter.add(egui::Shape::closed_line(points, stroke));
             }
-            _ => {
-                let points = vec![
-                    Pos2::new(left, bottom),
-                    Pos2::new(center.x - 1.0, top + 1.0),
-                    Pos2::new(right, center.y + 1.0),
-                ];
+            _ if points.len() >= 2 => {
                 for pair in points.windows(2) {
                     painter.line_segment([pair[0], pair[1]], stroke);
                 }
-                if object.closed {
+                if object.closed && points.len() > 2 {
                     painter.line_segment([*points.last().unwrap(), points[0]], stroke);
                 }
+            }
+            _ => {
+                painter.circle_stroke(preview.center(), 1.8, stroke);
             }
         }
     }
