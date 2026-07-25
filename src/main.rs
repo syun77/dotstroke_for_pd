@@ -194,6 +194,29 @@ impl DotStrokeApp {
         }
     }
 
+    fn export_png(&mut self) {
+        let default_name = self
+            .current_file
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map(|stem| format!("{}.png", stem.to_string_lossy()))
+            .unwrap_or_else(|| "document.png".into());
+        let path = rfd::FileDialog::new()
+            .add_filter("PNG", &["png"])
+            .set_file_name(default_name)
+            .save_file();
+        if let Some(path) = path {
+            let path = path.with_extension("png");
+            let width = self.doc.target.width.max(1) as usize;
+            let height = self.doc.target.height.max(1) as usize;
+            let pixels = self.pixel_preview_with_background(Color32::TRANSPARENT, true);
+            match io::save_png(&path, width as u32, height as u32, &pixels) {
+                Ok(()) => self.status = format!("Exported PNG {}", path.display()),
+                Err(_) => self.status = "Failed to export PNG".into(),
+            }
+        }
+    }
+
     fn load_dither_icons(&mut self, ctx: &egui::Context) {
         let icon_dirs = [
             PathBuf::from(DITHER_ICON_DIR),
@@ -1026,7 +1049,7 @@ impl DotStrokeApp {
             })
             .collect();
         let color = match object.style.color.as_str() {
-            "white" => Color32::GRAY,
+            "white" => Color32::WHITE,
             "clear" => config::colors::clear_color(),
             _ => Color32::BLACK,
         };
@@ -1876,6 +1899,9 @@ impl DotStrokeApp {
     }
 
     fn apply_raster_blend_color(current: Color32, color: Color32, blend: &str) -> Color32 {
+        if color == Color32::TRANSPARENT {
+            return Color32::TRANSPARENT;
+        }
         if blend == "xor" {
             if current == Color32::BLACK {
                 Color32::WHITE
@@ -2093,13 +2119,20 @@ impl DotStrokeApp {
         width: usize,
         height: usize,
         object: &VectorObject,
+        transparent_background: bool,
     ) {
         if !object.visible || object.points.is_empty() {
             return;
         }
         let color = match object.style.color.as_str() {
             "white" => Color32::WHITE,
-            "clear" => Color32::WHITE,
+            "clear" => {
+                if transparent_background {
+                    Color32::TRANSPARENT
+                } else {
+                    Color32::WHITE
+                }
+            }
             _ => Color32::BLACK,
         };
         let stroke_width = object.style.width.max(1) as f32;
@@ -2136,7 +2169,7 @@ impl DotStrokeApp {
                 );
             }
             for child in &object.children {
-                self.rasterize_object(pixels, width, height, child);
+                self.rasterize_object(pixels, width, height, child, transparent_background);
             }
             return;
         }
@@ -2152,7 +2185,7 @@ impl DotStrokeApp {
                 &object.style.dither_pattern,
             );
             for child in &object.children {
-                self.rasterize_object(pixels, width, height, child);
+                self.rasterize_object(pixels, width, height, child, transparent_background);
             }
             return;
         }
@@ -2204,7 +2237,7 @@ impl DotStrokeApp {
             }
             if !object.style.fill {
                 for child in &object.children {
-                    self.rasterize_object(pixels, width, height, child);
+                    self.rasterize_object(pixels, width, height, child, transparent_background);
                 }
                 return;
             }
@@ -2309,22 +2342,53 @@ impl DotStrokeApp {
         }
 
         for child in &object.children {
-            self.rasterize_object(pixels, width, height, child);
+            self.rasterize_object(pixels, width, height, child, transparent_background);
         }
     }
 
-    fn pixel_preview(&self) -> Vec<Color32> {
+    fn pixel_preview_with_background(
+        &self,
+        background: Color32,
+        transparent_background: bool,
+    ) -> Vec<Color32> {
         let width = self.doc.target.width.max(1) as usize;
         let height = self.doc.target.height.max(1) as usize;
-        let mut pixels = vec![Color32::WHITE; width * height];
+        let mut pixels = vec![background; width * height];
         for layer in &self.doc.layers {
             if layer.visible {
                 for object in &layer.objects {
-                    self.rasterize_object(&mut pixels, width, height, object);
+                    self.rasterize_object(
+                        &mut pixels,
+                        width,
+                        height,
+                        object,
+                        transparent_background,
+                    );
                 }
             }
         }
         pixels
+    }
+
+    fn draw_transparency_checkerboard(painter: &egui::Painter, rect: Rect, cell_size: f32) {
+        let cell_size = cell_size.max(2.0);
+        let columns = (rect.width() / cell_size).ceil() as i32;
+        let rows = (rect.height() / cell_size).ceil() as i32;
+        painter.rect_filled(rect, 0.0, config::colors::transparency_checker_light());
+        for row in 0..rows {
+            for column in 0..columns {
+                if (row + column) % 2 == 1 {
+                    let cell = Rect::from_min_size(
+                        Pos2::new(
+                            rect.left() + column as f32 * cell_size,
+                            rect.top() + row as f32 * cell_size,
+                        ),
+                        Vec2::splat(cell_size),
+                    );
+                    painter.rect_filled(cell, 0.0, config::colors::transparency_checker_dark());
+                }
+            }
+        }
     }
 
     fn draw_canvas(&mut self, ui: &mut egui::Ui) {
@@ -2342,6 +2406,7 @@ impl DotStrokeApp {
         let w = self.doc.target.width as f32 * self.zoom;
         let h = self.doc.target.height as f32 * self.zoom;
         let canvas_rect = Rect::from_min_size(rect.left_top() + self.pan, Vec2::new(w, h));
+        Self::draw_transparency_checkerboard(&painter, canvas_rect, 8.0 * self.zoom);
         painter.rect_stroke(
             canvas_rect,
             0.0,
@@ -2402,7 +2467,7 @@ impl DotStrokeApp {
             None
         };
         if self.pixel_preview {
-            let pixels = self.pixel_preview();
+            let pixels = self.pixel_preview_with_background(Color32::WHITE, false);
             let width = self.doc.target.width.max(1) as usize;
             for (index, color) in pixels.into_iter().enumerate() {
                 let x = index % width;
@@ -2654,7 +2719,7 @@ impl DotStrokeApp {
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let painter = ui.painter_at(rect).with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::WHITE);
-        let pixels = self.pixel_preview();
+        let pixels = self.pixel_preview_with_background(Color32::WHITE, false);
         let width = self.doc.target.width.max(1) as usize;
         for (index, color) in pixels.into_iter().enumerate() {
             let x = index % width;
@@ -2692,14 +2757,23 @@ impl eframe::App for DotStrokeApp {
         if redo_pressed {
             self.redo_document();
         }
-        let (native_new, native_load, native_save) = self.native_menu.actions();
-        let (shortcut_new, shortcut_load, shortcut_save, shortcut_copy_playdate_lua) =
+        let (native_new, native_load, native_save, native_export_png) = self.native_menu.actions();
+        let (
+            shortcut_new,
+            shortcut_load,
+            shortcut_save,
+            shortcut_export_png,
+            shortcut_copy_playdate_lua,
+        ) =
             ui.input(|input| {
                 let modifier = input.modifiers.ctrl || input.modifiers.command;
                 (
                     modifier && input.key_pressed(egui::Key::N), // 新規作成.
                     modifier && input.key_pressed(egui::Key::O), // JSON読み込み.
                     modifier && input.key_pressed(egui::Key::S), // JSON保存.
+                    modifier
+                        && input.modifiers.shift
+                        && input.key_pressed(egui::Key::E), // PNGエクスポート.
                     modifier && input.key_pressed(egui::Key::P), // Copy Playdate Lua.
                 )
             });
@@ -2711,6 +2785,9 @@ impl eframe::App for DotStrokeApp {
         }
         if native_save || shortcut_save {
             self.save_json_document();
+        }
+        if native_export_png || shortcut_export_png {
+            self.export_png();
         }
         if shortcut_copy_playdate_lua {
             ui.ctx().copy_text(self.playdate_lua(false));
@@ -2729,6 +2806,10 @@ impl eframe::App for DotStrokeApp {
                     }
                     if ui.button("Save JSON    Cmd+S").clicked() {
                         self.save_json_document();
+                        ui.close();
+                    }
+                    if ui.button("Export PNG    Cmd+Shift+E").clicked() {
+                        self.export_png();
                         ui.close();
                     }
                 });

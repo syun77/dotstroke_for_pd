@@ -48,6 +48,10 @@ pub mod colors {
 
     // ditherアイコン内チェッカーの濃いマス色
     pub const DITHER_SWATCH_CHECKER_DARK_HEX: &str = "#D7D7D7";
+    // 透明部分を示すチェッカーボードの明るいマス色
+    pub const TRANSPARENCY_CHECKER_LIGHT_HEX: &str = "#8e8e8e";
+    // 透明部分を示すチェッカーボードの薄い灰色マス色
+    pub const TRANSPARENCY_CHECKER_DARK_HEX: &str = "#dcdcdc";
     // ditherアイコン内の斜線色
     pub const DITHER_SWATCH_DIAGONAL_HEX: &str = "#3C96FF";
     // 選択中のditherアイコン枠色（強調表示）
@@ -106,6 +110,14 @@ pub mod colors {
 
     pub fn dither_swatch_checker_dark() -> Color32 {
         parse_hex_color(DITHER_SWATCH_CHECKER_DARK_HEX)
+    }
+
+    pub fn transparency_checker_light() -> Color32 {
+        parse_hex_color(TRANSPARENCY_CHECKER_LIGHT_HEX)
+    }
+
+    pub fn transparency_checker_dark() -> Color32 {
+        parse_hex_color(TRANSPARENCY_CHECKER_DARK_HEX)
     }
 
     pub fn dither_swatch_diagonal() -> Color32 {

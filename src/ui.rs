@@ -8,6 +8,7 @@ pub struct NativeMenu {
     new_id: MenuId,
     load_id: MenuId,
     save_id: MenuId,
+    export_png_id: MenuId,
 }
 impl NativeMenu {
     pub fn new() -> Self {
@@ -27,7 +28,19 @@ impl NativeMenu {
             true,
             Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyS)),
         );
-        let file_menu = Submenu::with_items("File", true, &[&new_item, &load_item, &save_item])
+        let export_png_item = MenuItem::new(
+            "Export PNG",
+            true,
+            Some(Accelerator::new(
+                Some(Modifiers::SUPER | Modifiers::SHIFT),
+                Code::KeyE,
+            )),
+        );
+        let file_menu = Submenu::with_items(
+            "File",
+            true,
+            &[&new_item, &load_item, &save_item, &export_png_item],
+        )
             .expect("failed to create File menu");
         menu.append(&file_menu).expect("failed to append File menu");
         Self {
@@ -35,14 +48,15 @@ impl NativeMenu {
             new_id: new_item.id().clone(),
             load_id: load_item.id().clone(),
             save_id: save_item.id().clone(),
+            export_png_id: export_png_item.id().clone(),
         }
     }
     pub fn init(&self) {
         #[cfg(target_os = "macos")]
         self.menu.init_for_nsapp();
     }
-    pub fn actions(&self) -> (bool, bool, bool) {
-        let mut actions = (false, false, false);
+    pub fn actions(&self) -> (bool, bool, bool, bool) {
+        let mut actions = (false, false, false, false);
         for event in MenuEvent::receiver().try_iter() {
             if event.id == self.new_id {
                 actions.0 = true;
@@ -50,6 +64,8 @@ impl NativeMenu {
                 actions.1 = true;
             } else if event.id == self.save_id {
                 actions.2 = true;
+            } else if event.id == self.export_png_id {
+                actions.3 = true;
             }
         }
         actions
