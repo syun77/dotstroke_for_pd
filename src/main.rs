@@ -38,7 +38,6 @@ struct DotStrokeApp {
     tool: String,
     color: String,
     width: i32,
-    fill: bool,
     radius: i32,
     dither_pattern: String,
     rounding: String,
@@ -68,7 +67,6 @@ impl Default for DotStrokeApp {
             tool: "line".into(),
             color: "black".into(),
             width: 1,
-            fill: false,
             radius: 4,
             dither_pattern: "none".into(),
             rounding: "nearest".into(),
@@ -94,6 +92,33 @@ impl Default for DotStrokeApp {
 }
 
 impl DotStrokeApp {
+    fn current_tool_kind(&self) -> &str {
+        match self.tool.as_str() {
+            "fill_rect" => "rect",
+            "fill_round_rect" => "round_rect",
+            "fill_circle" => "ellipse",
+            "fill_polygon" => "polygon",
+            _ => self.tool.as_str(),
+        }
+    }
+
+    fn current_tool_fill(&self) -> bool {
+        matches!(
+            self.tool.as_str(),
+            "fill_rect" | "fill_round_rect" | "fill_circle" | "fill_polygon"
+        )
+    }
+
+    fn current_tool_label(&self) -> &str {
+        match self.tool.as_str() {
+            "fill_rect" => "fill rect",
+            "fill_round_rect" => "fill round rect",
+            "fill_circle" => "fill circle",
+            "fill_polygon" => "fill polygon",
+            _ => self.tool.as_str(),
+        }
+    }
+
     fn save_history(&mut self) {
         self.history.save(&self.doc);
     }
@@ -372,7 +397,9 @@ impl DotStrokeApp {
     }
 
     fn commit_pending(&mut self, closed: bool) {
-        let required = match self.tool.as_str() {
+        let tool_kind = self.current_tool_kind().to_string();
+        let tool_fill = self.current_tool_fill();
+        let required = match tool_kind.as_str() {
             "polygon" => 3,
             _ => 2,
         };
@@ -382,13 +409,13 @@ impl DotStrokeApp {
         self.save_history();
         let layer = &mut self.doc.layers[self.current_layer];
         layer.objects.push(VectorObject {
-            kind: self.tool.clone(),
+            kind: tool_kind,
             points: self.pending.drain(..).collect(),
             closed,
             style: Style {
                 color: self.color.clone(),
                 width: self.width,
-                fill: self.fill,
+                fill: tool_fill,
                 radius: self.radius,
                 dither_pattern: self.dither_pattern.clone(),
                 ..Style::default()
@@ -631,6 +658,13 @@ impl DotStrokeApp {
                     stroke,
                 ));
             }
+            "polygon" if pts.len() >= 3 => {
+                if object.style.fill {
+                    painter.add(egui::Shape::convex_polygon(pts.clone(), color, stroke));
+                } else {
+                    painter.add(egui::Shape::closed_line(pts.clone(), stroke));
+                }
+            }
             _ => {
                 for pair in pts.windows(2) {
                     painter.line_segment([pair[0], pair[1]], stroke);
@@ -643,7 +677,9 @@ impl DotStrokeApp {
     }
 
     fn draw_tool_preview(&self, painter: &egui::Painter, rect: Rect, cursor: Pos2) {
-        if self.tool == "select" {
+        let tool_kind = self.current_tool_kind();
+        let fill_shape = self.current_tool_fill();
+        if tool_kind == "select" {
             return;
         }
 
@@ -656,7 +692,7 @@ impl DotStrokeApp {
             preview_color,
         );
 
-        match self.tool.as_str() {
+        match tool_kind {
             "pixel" => {
                 painter.circle_filled(
                     cursor,
@@ -673,10 +709,23 @@ impl DotStrokeApp {
                     painter.circle_stroke(cursor, 6.0, preview_stroke);
                 }
             }
-            "polygon" => {
+                "polygon" | "fill_polygon" => {
                 if let Some(point) = self.pending.last() {
                     painter
                         .line_segment([self.doc_to_screen(rect, *point), cursor], preview_stroke);
+                    if fill_shape && self.pending.len() >= 2 {
+                        let mut polygon_points = self
+                            .pending
+                            .iter()
+                            .map(|point| self.doc_to_screen(rect, *point))
+                            .collect::<Vec<_>>();
+                        polygon_points.push(cursor);
+                        painter.add(egui::Shape::convex_polygon(
+                            polygon_points,
+                            preview_fill,
+                            Stroke::NONE,
+                        ));
+                    }
                     if self.pending.len() >= 2 {
                         painter.line_segment(
                             [cursor, self.doc_to_screen(rect, self.pending[0])],
@@ -691,24 +740,24 @@ impl DotStrokeApp {
                 if let Some(point) = self.pending.first() {
                     let start = self.doc_to_screen(rect, *point);
                     let bounds = Rect::from_two_pos(start, cursor);
-                    if matches!(self.tool.as_str(), "rect" | "round_rect") && self.fill {
-                        let radius = if self.tool == "round_rect" {
+                    if matches!(tool_kind, "rect" | "round_rect") && fill_shape {
+                        let radius = if tool_kind == "round_rect" {
                             self.radius.max(0) as f32 * self.zoom
                         } else {
                             0.0
                         };
                         painter.rect_filled(bounds, radius, preview_fill);
                     }
-                    if self.tool == "ellipse" && self.fill {
+                    if tool_kind == "ellipse" && fill_shape {
                         painter.add(egui::Shape::ellipse_filled(
                             bounds.center(),
                             Vec2::new(bounds.width() / 2.0, bounds.height() / 2.0),
                             preview_fill,
                         ));
                     }
-                    if self.tool == "rect" {
+                    if tool_kind == "rect" {
                         painter.rect_stroke(bounds, 0.0, preview_stroke, egui::StrokeKind::Middle);
-                    } else if self.tool == "round_rect" {
+                    } else if tool_kind == "round_rect" {
                         painter.rect_stroke(
                             bounds,
                             self.radius.max(0) as f32 * self.zoom,
@@ -730,7 +779,7 @@ impl DotStrokeApp {
         }
     }
 
-    fn tool_icon(ui: &mut egui::Ui, tool: &str, selected: bool, filled: bool) -> egui::Response {
+    fn tool_icon(ui: &mut egui::Ui, tool: &str, selected: bool) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
         let painter = ui.painter_at(rect);
         let visuals = ui.style().interact_selectable(&response, selected);
@@ -805,41 +854,56 @@ impl DotStrokeApp {
                         Pos2::new(center.x + angle.cos() * 9.0, center.y + angle.sin() * 9.0)
                     })
                     .collect::<Vec<_>>();
-                if filled {
-                    painter.add(egui::Shape::convex_polygon(
-                        points,
-                        visuals.fg_stroke.color,
-                        icon_stroke,
-                    ));
-                } else {
-                    painter.add(egui::Shape::closed_line(points, icon_stroke));
-                }
+                painter.add(egui::Shape::closed_line(points, icon_stroke));
             }
             "rect" => {
                 let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
-                if filled {
-                    painter.rect_filled(bounds, 0.0, visuals.fg_stroke.color);
-                }
+                painter.rect_stroke(bounds, 0.0, icon_stroke, egui::StrokeKind::Inside);
+            }
+            "fill_rect" => {
+                let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+                painter.rect_filled(bounds, 0.0, visuals.fg_stroke.color);
                 painter.rect_stroke(bounds, 0.0, icon_stroke, egui::StrokeKind::Inside);
             }
             "round_rect" => {
                 let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
-                if filled {
-                    painter.rect_filled(bounds, 4.0, visuals.fg_stroke.color);
-                }
+                painter.rect_stroke(bounds, 4.0, icon_stroke, egui::StrokeKind::Inside);
+            }
+            "fill_round_rect" => {
+                let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+                painter.rect_filled(bounds, 4.0, visuals.fg_stroke.color);
                 painter.rect_stroke(bounds, 4.0, icon_stroke, egui::StrokeKind::Inside);
             }
             "ellipse" => {
-                if filled {
-                    painter.add(egui::Shape::ellipse_filled(
-                        center,
-                        Vec2::new(10.0, 7.0),
-                        visuals.fg_stroke.color,
-                    ));
-                }
                 painter.add(egui::Shape::ellipse_stroke(
                     center,
                     Vec2::new(10.0, 7.0),
+                    icon_stroke,
+                ));
+            }
+            "fill_circle" => {
+                painter.add(egui::Shape::ellipse_filled(
+                    center,
+                    Vec2::new(10.0, 7.0),
+                    visuals.fg_stroke.color,
+                ));
+                painter.add(egui::Shape::ellipse_stroke(
+                    center,
+                    Vec2::new(10.0, 7.0),
+                    icon_stroke,
+                ));
+            }
+            "fill_polygon" => {
+                let points = (0..5)
+                    .map(|index| {
+                        let angle = -std::f32::consts::FRAC_PI_2
+                            + index as f32 * std::f32::consts::TAU / 5.0;
+                        Pos2::new(center.x + angle.cos() * 9.0, center.y + angle.sin() * 9.0)
+                    })
+                    .collect::<Vec<_>>();
+                painter.add(egui::Shape::convex_polygon(
+                    points,
+                    visuals.fg_stroke.color,
                     icon_stroke,
                 ));
             }
@@ -857,7 +921,13 @@ impl DotStrokeApp {
             }
             _ => {}
         }
-        response.on_hover_text(tool)
+        response.on_hover_text(match tool {
+            "fill_rect" => "fill rect",
+            "fill_round_rect" => "fill round rect",
+            "fill_circle" => "fill circle",
+            "fill_polygon" => "fill polygon",
+            _ => tool,
+        })
     }
 
     fn color_icon(ui: &mut egui::Ui, color: &str, selected: bool) -> egui::Response {
@@ -932,11 +1002,16 @@ impl DotStrokeApp {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
         let painter = ui.painter_at(rect);
         let visuals = ui.style().interact_selectable(&response, selected);
+        let frame_stroke = if selected {
+            Stroke::new(1.8, Color32::from_rgb(255, 180, 70))
+        } else {
+            visuals.bg_stroke
+        };
         painter.rect(
             rect,
             4.0,
             visuals.bg_fill,
-            visuals.bg_stroke,
+            frame_stroke,
             egui::StrokeKind::Outside,
         );
 
@@ -1672,12 +1747,27 @@ impl DotStrokeApp {
                             self.commit_pending(false);
                         }
                     }
-                    "polygon" => {
+                    "polygon" | "fill_polygon" => {
                         self.pending.push(p);
                     }
-                    "polyline" | "path" | "rect" | "round_rect" | "ellipse" => {
+                    "polyline"
+                    | "path"
+                    | "rect"
+                    | "fill_rect"
+                    | "round_rect"
+                    | "fill_round_rect"
+                    | "ellipse"
+                    | "fill_circle" => {
                         self.pending.push(p);
-                        if matches!(self.tool.as_str(), "rect" | "round_rect" | "ellipse")
+                        if matches!(
+                            self.tool.as_str(),
+                            "rect"
+                                | "fill_rect"
+                                | "round_rect"
+                                | "fill_round_rect"
+                                | "ellipse"
+                                | "fill_circle"
+                        )
                             && self.pending.len() == 2
                         {
                             self.commit_pending(false);
@@ -1688,7 +1778,7 @@ impl DotStrokeApp {
             }
         }
         if response.secondary_clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            self.commit_pending(self.tool == "polygon");
+            self.commit_pending(self.current_tool_kind() == "polygon");
         }
     }
 
@@ -1806,18 +1896,21 @@ impl eframe::App for DotStrokeApp {
                     "line",
                     "polyline",
                     "polygon",
+                    "fill_polygon",
                     "rect",
+                    "fill_rect",
                     "round_rect",
+                    "fill_round_rect",
                     "ellipse",
+                    "fill_circle",
                     "path",
                 ] {
-                    if Self::tool_icon(ui, tool, self.tool == tool, self.fill).clicked() {
+                    if Self::tool_icon(ui, tool, self.tool == tool).clicked() {
                         self.tool = tool.into();
                     }
                 }
             });
-            ui.checkbox(&mut self.fill, "Fill closed shape");
-            ui.label(format!("Selected: {}", self.tool));
+            ui.label(format!("Selected: {}", self.current_tool_label()));
             ui.separator();
             ui.label("Style");
             ui.horizontal(|ui| {
@@ -1875,7 +1968,7 @@ impl eframe::App for DotStrokeApp {
                 }
             }
             ui.add(egui::Slider::new(&mut self.width, 1..=8).text("Width"));
-            if self.tool == "round_rect" {
+            if matches!(self.tool.as_str(), "round_rect" | "fill_round_rect") {
                 ui.add(egui::Slider::new(&mut self.radius, 0..=16).text("Corner radius"));
             }
             ui.checkbox(&mut self.pixel_preview, "Pixel preview");
@@ -1901,7 +1994,7 @@ impl eframe::App for DotStrokeApp {
                 }
             });
             if ui.button("Finalize").clicked() {
-                self.commit_pending(self.tool == "polygon");
+                self.commit_pending(self.current_tool_kind() == "polygon");
             }
             if ui.button("Cancel").clicked() {
                 self.pending.clear();
