@@ -619,6 +619,10 @@ impl DotStrokeApp {
             _ => Color32::BLACK,
         };
         let stroke = Stroke::new((object.style.width.max(1) as f32) * zoom, color);
+        if object.style.dither_pattern != "none" {
+            self.draw_object_dithered_at(painter, rect, object, &pts, stroke, color, zoom, pan);
+            return;
+        }
         match object.kind.as_str() {
             "pixel" => {
                 painter.circle_filled(
@@ -672,6 +676,180 @@ impl DotStrokeApp {
                 }
                 if object.closed && pts.len() > 2 {
                     painter.line_segment([*pts.last().unwrap(), pts[0]], stroke);
+                }
+            }
+        }
+    }
+
+    fn point_in_polygon_pos2(sample: Pos2, points: &[Pos2]) -> bool {
+        if points.len() < 3 {
+            return false;
+        }
+        let mut inside = false;
+        let mut previous = *points.last().unwrap();
+        for &current in points {
+            let intersects = ((current.y > sample.y) != (previous.y > sample.y))
+                && (sample.x
+                    < (previous.x - current.x) * (sample.y - current.y)
+                        / ((previous.y - current.y).abs().max(f32::EPSILON))
+                        + current.x);
+            if intersects {
+                inside = !inside;
+            }
+            previous = current;
+        }
+        inside
+    }
+
+    fn vector_dither_allows_sample(
+        &self,
+        pattern: &str,
+        sample: Pos2,
+        rect: Rect,
+        zoom: f32,
+        pan: Vec2,
+    ) -> bool {
+        let cell = zoom.max(1.0);
+        let gx = ((sample.x - rect.left() - pan.x) / cell).floor();
+        let gy = ((sample.y - rect.top() - pan.y) / cell).floor();
+        if gx < 0.0 || gy < 0.0 {
+            return false;
+        }
+        Self::dither_allows_pixel(pattern, gx as usize, gy as usize)
+    }
+
+    fn draw_object_dithered_at(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        object: &VectorObject,
+        pts: &[Pos2],
+        stroke: Stroke,
+        color: Color32,
+        zoom: f32,
+        pan: Vec2,
+    ) {
+        if pts.is_empty() {
+            return;
+        }
+        let min_x = pts
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(rect.left().floor()) as i32;
+        let max_x = pts
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil()
+            .min(rect.right().ceil()) as i32;
+        let min_y = pts
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(rect.top().floor()) as i32;
+        let max_y = pts
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil()
+            .min(rect.bottom().ceil()) as i32;
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let sample = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let stroke_radius = stroke.width / 2.0;
+                let drawn = match object.kind.as_str() {
+                    "pixel" => sample.distance(pts[0]) <= stroke.width.max(1.0),
+                    "rect" if pts.len() >= 2 => {
+                        let left = pts[0].x.min(pts[1].x);
+                        let right = pts[0].x.max(pts[1].x);
+                        let top = pts[0].y.min(pts[1].y);
+                        let bottom = pts[0].y.max(pts[1].y);
+                        let inside =
+                            sample.x >= left && sample.x <= right && sample.y >= top && sample.y <= bottom;
+                        let edge_distance = (sample.x - left)
+                            .min(right - sample.x)
+                            .min((sample.y - top).min(bottom - sample.y));
+                        inside && (object.style.fill || edge_distance <= stroke_radius)
+                    }
+                    "round_rect" if pts.len() >= 2 => {
+                        let left = pts[0].x.min(pts[1].x);
+                        let right = pts[0].x.max(pts[1].x);
+                        let top = pts[0].y.min(pts[1].y);
+                        let bottom = pts[0].y.max(pts[1].y);
+                        let half_w = ((right - left) / 2.0).max(0.0);
+                        let half_h = ((bottom - top) / 2.0).max(0.0);
+                        let radius = (object.style.radius.max(0) as f32 * zoom)
+                            .min(half_w.min(half_h));
+                        let center_x = (left + right) / 2.0;
+                        let center_y = (top + bottom) / 2.0;
+                        let qx = (sample.x - center_x).abs() - (half_w - radius);
+                        let qy = (sample.y - center_y).abs() - (half_h - radius);
+                        let outside = qx.max(0.0).hypot(qy.max(0.0));
+                        let inside = qx.max(qy).min(0.0);
+                        let signed_distance = outside + inside - radius;
+                        if object.style.fill {
+                            signed_distance <= 0.0
+                        } else {
+                            signed_distance.abs() <= stroke_radius
+                        }
+                    }
+                    "ellipse" if pts.len() >= 2 => {
+                        let left = pts[0].x.min(pts[1].x);
+                        let right = pts[0].x.max(pts[1].x);
+                        let top = pts[0].y.min(pts[1].y);
+                        let bottom = pts[0].y.max(pts[1].y);
+                        let rx = (right - left) / 2.0;
+                        let ry = (bottom - top) / 2.0;
+                        if rx <= 0.0 || ry <= 0.0 {
+                            false
+                        } else {
+                            let dx = (sample.x - (left + right) / 2.0) / rx;
+                            let dy = (sample.y - (top + bottom) / 2.0) / ry;
+                            let value = dx * dx + dy * dy;
+                            (object.style.fill && value <= 1.0)
+                                || (!object.style.fill
+                                    && (value - 1.0).abs() * rx.min(ry) <= stroke_radius)
+                        }
+                    }
+                    "polygon" if pts.len() >= 3 => {
+                        let filled = object.style.fill && Self::point_in_polygon_pos2(sample, pts);
+                        let edge = pts
+                            .iter()
+                            .zip(pts.iter().cycle().skip(1))
+                            .take(pts.len())
+                            .any(|(start, end)| {
+                                editor::distance_to_segment(sample, *start, *end) <= stroke_radius
+                            });
+                        filled || edge
+                    }
+                    _ if pts.len() >= 2 => {
+                        pts.windows(2).any(|pair| {
+                            editor::distance_to_segment(sample, pair[0], pair[1]) <= stroke_radius
+                        }) || (object.closed
+                            && editor::distance_to_segment(sample, *pts.last().unwrap(), pts[0])
+                                <= stroke_radius)
+                    }
+                    _ => false,
+                };
+                if drawn
+                    && self.vector_dither_allows_sample(
+                        &object.style.dither_pattern,
+                        sample,
+                        rect,
+                        zoom,
+                        pan,
+                    )
+                {
+                    let pixel =
+                        Rect::from_min_size(Pos2::new(x as f32, y as f32), Vec2::splat(1.0));
+                    painter.rect_filled(pixel, 0.0, color);
                 }
             }
         }
@@ -1151,6 +1329,7 @@ impl DotStrokeApp {
         y: i32,
         color: Color32,
         line_width: f32,
+        dither_pattern: &str,
     ) {
         let brush_radius = ((line_width.ceil() - 1.0) / 2.0).floor() as i32;
         for dy in -brush_radius..=brush_radius {
@@ -1161,9 +1340,48 @@ impl DotStrokeApp {
                 let px = x + dx;
                 let py = y + dy;
                 if px >= 0 && py >= 0 && (px as usize) < width && (py as usize) < height {
-                    pixels[py as usize * width + px as usize] = color;
+                    if Self::dither_allows_pixel(dither_pattern, px as usize, py as usize) {
+                        pixels[py as usize * width + px as usize] = color;
+                    }
                 }
             }
+        }
+    }
+
+    fn bayer_4x4_threshold(x: usize, y: usize) -> u8 {
+        const MATRIX: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+        MATRIX[y % 4][x % 4]
+    }
+
+    fn bayer_8x8_threshold(x: usize, y: usize) -> u8 {
+        const MATRIX: [[u8; 8]; 8] = [
+            [0, 48, 12, 60, 3, 51, 15, 63],
+            [32, 16, 44, 28, 35, 19, 47, 31],
+            [8, 56, 4, 52, 11, 59, 7, 55],
+            [40, 24, 36, 20, 43, 27, 39, 23],
+            [2, 50, 14, 62, 1, 49, 13, 61],
+            [34, 18, 46, 30, 33, 17, 45, 29],
+            [10, 58, 6, 54, 9, 57, 5, 53],
+            [42, 26, 38, 22, 41, 25, 37, 21],
+        ];
+        MATRIX[y % 8][x % 8]
+    }
+
+    fn dither_allows_pixel(pattern: &str, x: usize, y: usize) -> bool {
+        match pattern {
+            "none" => true,
+            "diagonal_line" => (x + y) % 6 < 3,
+            "vertical_line" => x % 4 < 2,
+            "horizontal_line" => y % 4 < 2,
+            "screen" => (x + y) % 2 == 0,
+            "bayer_2x2" => (x % 2) == (y % 2),
+            "bayer_4x4" => Self::bayer_4x4_threshold(x, y) < 8,
+            "bayer_8x8" => Self::bayer_8x8_threshold(x, y) < 32,
+            // These approximate Playdate's error-diffusion styles with stable 50% masks.
+            "floyd_steinberg" => ((x * 5 + y * 3) & 7) < 4,
+            "burkes" => ((x * 3 + y * 5 + x / 2) & 7) < 4,
+            "atkinson" => ((x * 7 + y * 2 + (x ^ y)) & 7) < 4,
+            _ => true,
         }
     }
 
@@ -1175,6 +1393,7 @@ impl DotStrokeApp {
         end: Pos2,
         color: Color32,
         line_width: f32,
+        dither_pattern: &str,
     ) {
         let mut x0 = start.x.round() as i32;
         let mut y0 = start.y.round() as i32;
@@ -1187,7 +1406,16 @@ impl DotStrokeApp {
         let mut error = dx + dy;
 
         loop {
-            Self::put_raster_pixel(pixels, width, height, x0, y0, color, line_width);
+            Self::put_raster_pixel(
+                pixels,
+                width,
+                height,
+                x0,
+                y0,
+                color,
+                line_width,
+                dither_pattern,
+            );
             if x0 == x1 && y0 == y1 {
                 break;
             }
@@ -1210,6 +1438,7 @@ impl DotStrokeApp {
         bounds: [f32; 4],
         color: Color32,
         line_width: f32,
+        dither_pattern: &str,
     ) {
         let left = bounds[0].round() as i32;
         let top = bounds[1].round() as i32;
@@ -1232,7 +1461,16 @@ impl DotStrokeApp {
                 (center_x + x, center_y - y),
                 (center_x - x, center_y - y),
             ] {
-                Self::put_raster_pixel(pixels, width, height, px, py, color, line_width);
+                Self::put_raster_pixel(
+                    pixels,
+                    width,
+                    height,
+                    px,
+                    py,
+                    color,
+                    line_width,
+                    dither_pattern,
+                );
             }
             if decision < 0 {
                 x += 1;
@@ -1253,7 +1491,16 @@ impl DotStrokeApp {
                 (center_x + x, center_y - y),
                 (center_x - x, center_y - y),
             ] {
-                Self::put_raster_pixel(pixels, width, height, px, py, color, line_width);
+                Self::put_raster_pixel(
+                    pixels,
+                    width,
+                    height,
+                    px,
+                    py,
+                    color,
+                    line_width,
+                    dither_pattern,
+                );
             }
             if decision > 0 {
                 y -= 1;
@@ -1297,6 +1544,7 @@ impl DotStrokeApp {
                     pair[1],
                     color,
                     stroke_width,
+                    &object.style.dither_pattern,
                 );
             }
             if object.closed && points.len() > 2 {
@@ -1308,6 +1556,7 @@ impl DotStrokeApp {
                     points[0],
                     color,
                     stroke_width,
+                    &object.style.dither_pattern,
                 );
             }
             for child in &object.children {
@@ -1323,6 +1572,7 @@ impl DotStrokeApp {
                 [points[0].x, points[0].y, points[1].x, points[1].y],
                 color,
                 stroke_width,
+                &object.style.dither_pattern,
             );
             for child in &object.children {
                 self.rasterize_object(pixels, width, height, child);
@@ -1363,7 +1613,16 @@ impl DotStrokeApp {
                 .zip(points.iter().cycle().skip(1))
                 .take(points.len())
             {
-                Self::draw_raster_line(pixels, width, height, *start, *end, color, stroke_width);
+                Self::draw_raster_line(
+                    pixels,
+                    width,
+                    height,
+                    *start,
+                    *end,
+                    color,
+                    stroke_width,
+                    &object.style.dither_pattern,
+                );
             }
             if !object.style.fill {
                 for child in &object.children {
@@ -1378,7 +1637,7 @@ impl DotStrokeApp {
                 let sample = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
                 let drawn = match object.kind.as_str() {
                     "pixel" => sample.distance(points[0]) <= stroke_width,
-                    "rect" | "round_rect" if points.len() >= 2 => {
+                    "rect" if points.len() >= 2 => {
                         let left = points[0].x.min(points[1].x);
                         let right = points[0].x.max(points[1].x);
                         let top = points[0].y.min(points[1].y);
@@ -1391,6 +1650,28 @@ impl DotStrokeApp {
                             .min(right - sample.x)
                             .min((sample.y - top).min(bottom - sample.y));
                         inside && (object.style.fill || edge_distance <= stroke_width / 2.0)
+                    }
+                    "round_rect" if points.len() >= 2 => {
+                        let left = points[0].x.min(points[1].x);
+                        let right = points[0].x.max(points[1].x);
+                        let top = points[0].y.min(points[1].y);
+                        let bottom = points[0].y.max(points[1].y);
+                        let half_w = ((right - left) / 2.0).max(0.0);
+                        let half_h = ((bottom - top) / 2.0).max(0.0);
+                        let radius = object.style.radius.max(0) as f32;
+                        let corner = radius.min(half_w.min(half_h));
+                        let center_x = (left + right) / 2.0;
+                        let center_y = (top + bottom) / 2.0;
+                        let qx = (sample.x - center_x).abs() - (half_w - corner);
+                        let qy = (sample.y - center_y).abs() - (half_h - corner);
+                        let outside = qx.max(0.0).hypot(qy.max(0.0));
+                        let inside = qx.max(qy).min(0.0);
+                        let signed_distance = outside + inside - corner;
+                        if object.style.fill {
+                            signed_distance <= 0.0
+                        } else {
+                            signed_distance.abs() <= stroke_width / 2.0
+                        }
                     }
                     "ellipse" if points.len() >= 2 => {
                         let left = points[0].x.min(points[1].x);
@@ -1437,7 +1718,9 @@ impl DotStrokeApp {
                     _ => false,
                 };
                 if drawn {
-                    pixels[y * width + x] = color;
+                    if Self::dither_allows_pixel(&object.style.dither_pattern, x, y) {
+                        pixels[y * width + x] = color;
+                    }
                 }
             }
         }
@@ -1784,12 +2067,16 @@ impl DotStrokeApp {
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let painter = ui.painter_at(rect).with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::WHITE);
-        for layer in &self.doc.layers {
-            if layer.visible {
-                for object in &layer.objects {
-                    self.draw_object_at(&painter, rect, object, 1.0, Vec2::ZERO);
-                }
-            }
+        let pixels = self.pixel_preview();
+        let width = self.doc.target.width.max(1) as usize;
+        for (index, color) in pixels.into_iter().enumerate() {
+            let x = index % width;
+            let y = index / width;
+            let pixel_rect = Rect::from_min_size(
+                Pos2::new(rect.left() + x as f32 * scale, rect.top() + y as f32 * scale),
+                Vec2::splat(scale),
+            );
+            painter.rect_filled(pixel_rect, 0.0, color);
         }
         painter.rect_stroke(
             rect,
