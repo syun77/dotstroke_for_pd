@@ -52,20 +52,40 @@ impl DotStrokeApp {
             .add_filter("JSON", &["json"])
             .pick_file()
         {
-            match io::load_document(&path) {
-                Ok(doc) => {
-                    self.save_history();
-                    self.saved_document = doc.clone();
-                    self.doc = doc;
-                    self.current_file = Some(path.clone());
-                    self.pending.clear();
-                    self.selected = None;
-                    self.selected_point = None;
-                    self.status = format!("Loaded {}", path.display());
-                }
-                Err(_) => self.status = "Failed to load JSON".into(),
-            }
+            self.load_json_document_from_path(&path);
         }
+    }
+
+    pub(super) fn load_json_document_from_path(&mut self, path: &Path) {
+        match io::load_document(path) {
+            Ok(doc) => {
+                self.save_history();
+                self.saved_document = doc.clone();
+                self.doc = doc;
+                let path = path.to_path_buf();
+                self.current_file = Some(path.clone());
+                self.recent_files.retain(|recent| recent != &path);
+                self.recent_files.insert(0, path.clone());
+                io::save_recent_files(&self.recent_files);
+                self.pending.clear();
+                self.selected = None;
+                self.selected_point = None;
+                self.status = format!("Loaded {}", path.display());
+            }
+            Err(error) => self.status = format!("Failed to load JSON: {error}"),
+        }
+    }
+
+    pub(super) fn restore_last_document(&mut self) {
+        self.recent_files = io::load_recent_files();
+        if let Some(path) = self.recent_files.first().cloned() {
+            self.load_json_document_from_path(&path);
+        }
+    }
+
+    pub(super) fn clear_recent_files(&mut self) {
+        self.recent_files.clear();
+        io::save_recent_files(&self.recent_files);
     }
 
     pub(super) fn save_json_document(&mut self) {
@@ -79,7 +99,37 @@ impl DotStrokeApp {
                 Ok(()) => {
                     self.saved_document = self.doc.clone();
                     self.current_file = Some(path.clone());
+                    self.recent_files.retain(|recent| recent != &path);
+                    self.recent_files.insert(0, path.clone());
+                    io::save_recent_files(&self.recent_files);
                     self.status = format!("Saved {}", path.display());
+                }
+                Err(_) => self.status = "Failed to save JSON".into(),
+            }
+        }
+    }
+
+    pub(super) fn save_json_document_as(&mut self) {
+        let default_name = self
+            .current_file
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "document.json".into());
+        let path = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_file_name(default_name)
+            .save_file();
+        if let Some(path) = path {
+            let path = path.with_extension("json");
+            match io::save_document(&path, &self.doc) {
+                Ok(()) => {
+                    self.saved_document = self.doc.clone();
+                    self.current_file = Some(path.clone());
+                    self.recent_files.retain(|recent| recent != &path);
+                    self.recent_files.insert(0, path.clone());
+                    io::save_recent_files(&self.recent_files);
+                    self.status = format!("Saved as {}", path.display());
                 }
                 Err(_) => self.status = "Failed to save JSON".into(),
             }

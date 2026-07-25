@@ -114,6 +114,7 @@ pub fn run() -> eframe::Result {
             let mut app = DotStrokeApp::default();
             app.native_menu = native_menu;
             app.load_dither_icons(&_cc.egui_ctx);
+            app.restore_last_document();
             Ok(Box::new(app))
         }),
     )

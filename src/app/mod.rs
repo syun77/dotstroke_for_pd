@@ -131,11 +131,13 @@ impl eframe::App for DotStrokeApp {
                 }
             }
         }
-        let (native_new, native_load, native_save, native_export_png) = self.native_menu.actions();
+        let (native_new, native_load, native_save, native_save_as, native_export_png) =
+            self.native_menu.actions();
         let (
             shortcut_new,
             shortcut_load,
             shortcut_save,
+            shortcut_save_as,
             shortcut_export_png,
             shortcut_copy_playdate_lua,
         ) = ui.input(|input| {
@@ -143,7 +145,8 @@ impl eframe::App for DotStrokeApp {
             (
                 modifier && input.key_pressed(egui::Key::N), // 新規作成.
                 modifier && input.key_pressed(egui::Key::O), // JSON読み込み.
-                modifier && input.key_pressed(egui::Key::S), // JSON保存.
+                modifier && !input.modifiers.shift && input.key_pressed(egui::Key::S), // JSON保存.
+                modifier && input.modifiers.shift && input.key_pressed(egui::Key::S), // 名前を付けて保存.
                 modifier && input.modifiers.shift && input.key_pressed(egui::Key::E), // PNGエクスポート.
                 modifier && input.key_pressed(egui::Key::P), // Copy Playdate Lua.
             )
@@ -156,6 +159,9 @@ impl eframe::App for DotStrokeApp {
         }
         if native_save || shortcut_save {
             self.save_json_document();
+        }
+        if native_save_as || shortcut_save_as {
+            self.save_json_document_as();
         }
         if native_export_png || shortcut_export_png {
             self.export_png();
@@ -175,8 +181,32 @@ impl eframe::App for DotStrokeApp {
                         self.load_json_document();
                         ui.close();
                     }
+                    ui.menu_button("Open Recent", |ui| {
+                        ui.set_min_width(config::ui::RECENT_FILES_MENU_WIDTH);
+                        let recent_files = self.recent_files.clone();
+                        if recent_files.is_empty() {
+                            ui.label("No recent files");
+                        } else {
+                            for path in recent_files {
+                                let label = path.display().to_string();
+                                if ui.button(label).clicked() {
+                                    self.load_json_document_from_path(&path);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Clear Recent Files").clicked() {
+                                self.clear_recent_files();
+                                ui.close();
+                            }
+                        }
+                    });
                     if ui.button("Save JSON    Cmd+S").clicked() {
                         self.save_json_document();
+                        ui.close();
+                    }
+                    if ui.button("Save JSON As    Cmd+Shift+S").clicked() {
+                        self.save_json_document_as();
                         ui.close();
                     }
                     if ui.button("Export PNG    Cmd+Shift+E").clicked() {

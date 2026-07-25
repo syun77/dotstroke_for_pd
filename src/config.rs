@@ -27,6 +27,8 @@ pub mod ui {
     pub const VECTOR_VISIBILITY_WIDTH: f32 = 28.0;
     // 行末の上下ボタン領域。ここを除いたアイコン・名前部分がドラッグ対象
     pub const VECTOR_ROW_ACTION_WIDTH: f32 = 70.0;
+    // 最近使ったファイルのパスを表示するメニュー幅
+    pub const RECENT_FILES_MENU_WIDTH: f32 = 600.0;
 
     // UIの標準フォントサイズ
     pub const FONT_SIZE_BODY: f32 = 16.0;
