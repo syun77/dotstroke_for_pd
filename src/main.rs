@@ -1,7 +1,13 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
-use muda::accelerator::{Accelerator, Code, Modifiers};
-use muda::{Menu, MenuEvent, MenuId, MenuItem, Submenu};
-use serde::{Deserialize, Serialize};
+mod editor;
+mod export;
+mod io;
+mod model;
+mod render;
+mod ui;
+
+use editor::History;
+use model::{Document, Style, VectorObject, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 use std::{
     collections::HashMap,
     fmt::Write as _,
@@ -9,8 +15,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const DEFAULT_WIDTH: i32 = 32;
-const DEFAULT_HEIGHT: i32 = 32;
 const CONTROL_POINT_RADIUS: f32 = 4.0;
 const CONTROL_POINT_HOVER_RADIUS: f32 = 7.0;
 const CONTROL_POINT_HIT_RADIUS: f32 = 24.0;
@@ -28,165 +32,6 @@ const DITHER_PATTERNS: [&str; 11] = [
     "atkinson",
 ];
 const DITHER_ICON_DIR: &str = "assets/dither_icons";
-
-struct NativeMenu {
-    menu: Menu,
-    new_id: MenuId,
-    load_id: MenuId,
-    save_id: MenuId,
-}
-
-impl NativeMenu {
-    fn new() -> Self {
-        let menu = Menu::new();
-        let new_item = MenuItem::new(
-            "New",
-            true,
-            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyN)),
-        );
-        let load_item = MenuItem::new(
-            "Load JSON",
-            true,
-            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyO)),
-        );
-        let save_item = MenuItem::new(
-            "Save JSON",
-            true,
-            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyS)),
-        );
-        let file_menu = Submenu::with_items("File", true, &[&new_item, &load_item, &save_item])
-            .expect("failed to create File menu");
-        menu.append(&file_menu).expect("failed to append File menu");
-        Self {
-            menu,
-            new_id: new_item.id().clone(),
-            load_id: load_item.id().clone(),
-            save_id: save_item.id().clone(),
-        }
-    }
-
-    fn init(&self) {
-        #[cfg(target_os = "macos")]
-        self.menu.init_for_nsapp();
-    }
-
-    fn actions(&self) -> (bool, bool, bool) {
-        let mut new = false;
-        let mut load = false;
-        let mut save = false;
-        for event in MenuEvent::receiver().try_iter() {
-            if event.id == self.new_id {
-                new = true;
-            } else if event.id == self.load_id {
-                load = true;
-            } else if event.id == self.save_id {
-                save = true;
-            }
-        }
-        (new, load, save)
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct Style {
-    color: String,
-    blend: String,
-    width: i32,
-    cap: String,
-    fill: bool,
-    radius: i32,
-    dither_pattern: String,
-}
-
-impl Default for Style {
-    fn default() -> Self {
-        Self {
-            color: "black".into(),
-            blend: "normal".into(),
-            width: 1,
-            cap: "butt".into(),
-            fill: false,
-            radius: 4,
-            dither_pattern: "none".into(),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct VectorObject {
-    #[serde(rename = "type")]
-    kind: String,
-    points: Vec<[f32; 2]>,
-    closed: bool,
-    style: Style,
-    transform: serde_json::Value,
-    children: Vec<VectorObject>,
-    visible: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct Layer {
-    id: String,
-    visible: bool,
-    objects: Vec<VectorObject>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct Target {
-    sdk: String,
-    width: i32,
-    height: i32,
-    coordinate_system: String,
-    pixel_snap: String,
-    rounding: String,
-    clip: bool,
-}
-
-impl Default for Target {
-    fn default() -> Self {
-        Self {
-            sdk: "3.1.1".into(),
-            width: DEFAULT_WIDTH,
-            height: DEFAULT_HEIGHT,
-            coordinate_system: "top-left".into(),
-            pixel_snap: "integer".into(),
-            rounding: "nearest".into(),
-            clip: true,
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct Document {
-    format: String,
-    version: i32,
-    target: Target,
-    canvas: serde_json::Value,
-    optimize: serde_json::Value,
-    layers: Vec<Layer>,
-}
-
-impl Default for Document {
-    fn default() -> Self {
-        Self {
-            format: "pdvector".into(),
-            version: 1,
-            target: Target::default(),
-            canvas: serde_json::json!({"background":"white", "ditherAnchor":"screen"}),
-            optimize: serde_json::json!({"mergeCollinearLines":true, "removeDuplicatePoints":true, "simplifyTolerance":0}),
-            layers: vec![Layer {
-                id: "layer1".into(),
-                visible: true,
-                objects: vec![],
-            }],
-        }
-    }
-}
 
 struct DotStrokeApp {
     doc: Document,
@@ -207,13 +52,12 @@ struct DotStrokeApp {
     selected_point: Option<usize>,
     current_layer: usize,
     status: String,
-    undo: Vec<Document>,
-    redo: Vec<Document>,
+    history: History,
     new_dialog: bool,
     new_width: String,
     new_height: String,
     current_file: Option<PathBuf>,
-    native_menu: NativeMenu,
+    native_menu: ui::NativeMenu,
     dither_icons: HashMap<String, egui::TextureHandle>,
 }
 
@@ -238,13 +82,12 @@ impl Default for DotStrokeApp {
             selected_point: None,
             current_layer: 0,
             status: "Ready".into(),
-            undo: vec![],
-            redo: vec![],
+            history: History::default(),
             new_dialog: false,
             new_width: DEFAULT_WIDTH.to_string(),
             new_height: DEFAULT_HEIGHT.to_string(),
             current_file: None,
-            native_menu: NativeMenu::new(),
+            native_menu: ui::NativeMenu::new(),
             dither_icons: HashMap::new(),
         }
     }
@@ -252,16 +95,11 @@ impl Default for DotStrokeApp {
 
 impl DotStrokeApp {
     fn save_history(&mut self) {
-        self.undo.push(self.doc.clone());
-        self.redo.clear();
-        if self.undo.len() > 100 {
-            self.undo.remove(0);
-        }
+        self.history.save(&self.doc);
     }
 
     fn undo_document(&mut self) {
-        if let Some(previous) = self.undo.pop() {
-            self.redo.push(self.doc.clone());
+        if let Some(previous) = self.history.undo(&self.doc) {
             self.doc = previous;
             self.pending.clear();
             self.selected = None;
@@ -274,8 +112,7 @@ impl DotStrokeApp {
     }
 
     fn redo_document(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(self.doc.clone());
+        if let Some(next) = self.history.redo(&self.doc) {
             self.doc = next;
             self.pending.clear();
             self.selected = None;
@@ -298,11 +135,8 @@ impl DotStrokeApp {
             .add_filter("JSON", &["json"])
             .pick_file()
         {
-            match fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Document>(&s).ok())
-            {
-                Some(doc) => {
+            match io::load_document(&path) {
+                Ok(doc) => {
                     self.save_history();
                     self.doc = doc;
                     self.current_file = Some(path.clone());
@@ -311,7 +145,7 @@ impl DotStrokeApp {
                     self.selected_point = None;
                     self.status = format!("Loaded {}", path.display());
                 }
-                None => self.status = "Failed to load JSON".into(),
+                Err(_) => self.status = "Failed to load JSON".into(),
             }
         }
     }
@@ -323,15 +157,12 @@ impl DotStrokeApp {
                 .save_file()
         });
         if let Some(path) = path {
-            match serde_json::to_string_pretty(&self.doc)
-                .ok()
-                .and_then(|s| fs::write(&path, s).ok())
-            {
-                Some(_) => {
+            match io::save_document(&path, &self.doc) {
+                Ok(()) => {
                     self.current_file = Some(path.clone());
                     self.status = format!("Saved {}", path.display());
                 }
-                None => self.status = "Failed to save JSON".into(),
+                Err(_) => self.status = "Failed to save JSON".into(),
             }
         }
     }
@@ -376,21 +207,23 @@ impl DotStrokeApp {
     }
 
     fn screen_to_doc(&self, rect: Rect, p: Pos2) -> Pos2 {
-        Pos2::new(
-            (p.x - rect.left() - self.pan.x) / self.zoom,
-            (p.y - rect.top() - self.pan.y) / self.zoom,
-        )
+        render::ViewTransform {
+            zoom: self.zoom,
+            pan: self.pan,
+        }
+        .screen_to_document(rect, p)
     }
 
     fn doc_to_screen(&self, rect: Rect, p: [f32; 2]) -> Pos2 {
-        Pos2::new(
-            rect.left() + self.pan.x + p[0] * self.zoom,
-            rect.top() + self.pan.y + p[1] * self.zoom,
-        )
+        render::ViewTransform {
+            zoom: self.zoom,
+            pan: self.pan,
+        }
+        .document_to_screen(rect, p)
     }
 
     fn max_zoom(&self) -> f32 {
-        (self.viewport_size.x.min(self.viewport_size.y) / 8.0).max(0.25)
+        render::ViewTransform::max_zoom(self.viewport_size)
     }
 
     fn fit_canvas_to_viewport(&mut self) {
@@ -456,7 +289,7 @@ impl DotStrokeApp {
             .get(layer_index)?
             .objects
             .get(object_index)?;
-        let hit_radius = CONTROL_POINT_HIT_RADIUS;
+        let hit_radius = editor::hit_radius(rect, self.zoom).min(CONTROL_POINT_HIT_RADIUS);
         object
             .points
             .iter()
@@ -479,10 +312,7 @@ impl DotStrokeApp {
                 .get_mut(layer_index)
                 .and_then(|l| l.objects.get_mut(object_index))
             {
-                for point in &mut object.points {
-                    point[0] += delta.x;
-                    point[1] += delta.y;
-                }
+                editor::move_object(object, delta);
             }
         }
     }
@@ -570,43 +400,11 @@ impl DotStrokeApp {
     }
 
     fn lua_number(value: f32) -> String {
-        if value == 0.0 {
-            "0".into()
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn lua_color(color: &str) -> &'static str {
-        match color {
-            "white" => "gfx.kColorWhite",
-            "clear" => "gfx.kColorClear",
-            _ => "gfx.kColorBlack",
-        }
+        export::lua_number(value)
     }
 
     fn lua_cap_style(cap: &str) -> &'static str {
-        match cap {
-            "round" => "gfx.kLineCapStyleRound",
-            "square" => "gfx.kLineCapStyleSquare",
-            _ => "gfx.kLineCapStyleButt",
-        }
-    }
-
-    fn lua_dither_pattern(pattern: &str) -> Option<&'static str> {
-        match pattern {
-            "diagonal_line" => Some("gfx.image.kDitherTypeDiagonalLine"),
-            "vertical_line" => Some("gfx.image.kDitherTypeVerticalLine"),
-            "horizontal_line" => Some("gfx.image.kDitherTypeHorizontalLine"),
-            "screen" => Some("gfx.image.kDitherTypeScreen"),
-            "bayer_2x2" => Some("gfx.image.kDitherTypeBayer2x2"),
-            "bayer_4x4" => Some("gfx.image.kDitherTypeBayer4x4"),
-            "bayer_8x8" => Some("gfx.image.kDitherTypeBayer8x8"),
-            "floyd_steinberg" => Some("gfx.image.kDitherTypeFloydSteinberg"),
-            "burkes" => Some("gfx.image.kDitherTypeBurkes"),
-            "atkinson" => Some("gfx.image.kDitherTypeAtkinson"),
-            _ => None,
-        }
+        export::lua_cap_style(cap)
     }
 
     fn append_lua_object(output: &mut String, object: &VectorObject) {
@@ -620,9 +418,9 @@ impl DotStrokeApp {
         let _ = writeln!(
             output,
             "gfx.setColor({})",
-            Self::lua_color(&object.style.color)
+            export::lua_color(&object.style.color)
         );
-        if let Some(pattern) = Self::lua_dither_pattern(&object.style.dither_pattern) {
+        if let Some(pattern) = export::lua_dither_pattern(&object.style.dither_pattern) {
             let _ = writeln!(output, "gfx.setDitherPattern(0.5, {})", pattern);
         }
 
@@ -1277,32 +1075,6 @@ impl DotStrokeApp {
         response.on_hover_text(pattern)
     }
 
-    fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
-        let segment = end - start;
-        let length_sq = segment.length_sq();
-        if length_sq <= f32::EPSILON {
-            return point.distance(start);
-        }
-        let t = ((point - start).dot(segment) / length_sq).clamp(0.0, 1.0);
-        point.distance(start + segment * t)
-    }
-
-    fn point_in_polygon(point: Pos2, points: &[[f32; 2]]) -> bool {
-        let mut inside = false;
-        for (a, b) in points
-            .iter()
-            .zip(points.iter().cycle().skip(1))
-            .take(points.len())
-        {
-            let intersects = (a[1] > point.y) != (b[1] > point.y)
-                && point.x < (b[0] - a[0]) * (point.y - a[1]) / (b[1] - a[1]) + a[0];
-            if intersects {
-                inside = !inside;
-            }
-        }
-        inside
-    }
-
     fn put_raster_pixel(
         pixels: &mut [Color32],
         width: usize,
@@ -1572,23 +1344,23 @@ impl DotStrokeApp {
                     }
                     "polygon" if points.len() >= 3 => {
                         let filled =
-                            object.style.fill && Self::point_in_polygon(sample, &object.points);
+                            object.style.fill && editor::point_in_polygon(sample, &object.points);
                         let edge = points
                             .iter()
                             .zip(points.iter().cycle().skip(1))
                             .take(points.len())
                             .any(|(start, end)| {
-                                Self::distance_to_segment(sample, *start, *end)
+                                editor::distance_to_segment(sample, *start, *end)
                                     <= stroke_width / 2.0
                             });
                         filled || edge
                     }
                     _ if points.len() >= 2 => {
                         points.windows(2).any(|pair| {
-                            Self::distance_to_segment(sample, pair[0], pair[1])
+                            editor::distance_to_segment(sample, pair[0], pair[1])
                                 <= stroke_width / 2.0
                         }) || (object.closed
-                            && Self::distance_to_segment(
+                            && editor::distance_to_segment(
                                 sample,
                                 *points.last().unwrap(),
                                 points[0],
@@ -2245,7 +2017,7 @@ impl eframe::App for DotStrokeApp {
 }
 
 fn main() -> eframe::Result {
-    let native_menu = NativeMenu::new();
+    let native_menu = ui::NativeMenu::new();
     native_menu.init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
