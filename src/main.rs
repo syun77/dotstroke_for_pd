@@ -406,12 +406,8 @@ impl DotStrokeApp {
                 .get(layer_index)
                 .and_then(|layer| layer.objects.get(object_index))
                 .cloned();
-            if let Some(mut copy) = copy {
+            if let Some(copy) = copy {
                 self.save_history();
-                for point in &mut copy.points {
-                    point[0] += 8.0;
-                    point[1] += 8.0;
-                }
                 let new_index = object_index + 1;
                 self.doc.layers[layer_index].objects.insert(new_index, copy);
                 self.selected = Some((layer_index, new_index));
@@ -661,7 +657,11 @@ impl DotStrokeApp {
         }
     }
 
-    fn append_lua_object_simple(output: &mut String, object: &VectorObject) {
+    fn append_lua_object_simple(
+        output: &mut String,
+        object: &VectorObject,
+        dither_active: &mut bool,
+    ) {
         if !object.visible || object.points.is_empty() {
             return;
         }
@@ -676,6 +676,13 @@ impl DotStrokeApp {
         );
         if let Some(pattern) = export::lua_dither_pattern(&object.style.dither_pattern) {
             let _ = writeln!(output, "gfx.setDitherPattern(0.5, {})", pattern);
+            *dither_active = true;
+        } else if *dither_active {
+            let _ = writeln!(
+                output,
+                "gfx.setDitherPattern(0.5, gfx.image.kDitherTypeNone)"
+            );
+            *dither_active = false;
         }
 
         match object.kind.as_str() {
@@ -798,8 +805,21 @@ impl DotStrokeApp {
         }
 
         for child in &object.children {
-            Self::append_lua_object_simple(output, child);
+            Self::append_lua_object_simple(output, child, dither_active);
         }
+    }
+
+    fn last_visible_lua_color(object: &VectorObject) -> Option<&str> {
+        if !object.visible || object.points.is_empty() {
+            return None;
+        }
+        let mut color = object.style.color.as_str();
+        for child in &object.children {
+            if let Some(child_color) = Self::last_visible_lua_color(child) {
+                color = child_color;
+            }
+        }
+        Some(color)
     }
 
     #[allow(dead_code)]
@@ -924,7 +944,7 @@ impl DotStrokeApp {
 
         let _ = writeln!(output, "        local style = {}", style);
         output.push_str(
-            "        if style.blend == \"xor\" then\n            gfx.setColor(gfx.kColorXOR)\n        else\n            gfx.setColor(style.color or gfx.kColorBlack)\n        end\n        if style.ditherPattern then\n            gfx.setDitherPattern(0.5, style.ditherPattern)\n        end\n",
+            "        if style.blend == \"xor\" then\n            gfx.setColor(gfx.kColorXOR)\n        else\n            gfx.setColor(style.color or gfx.kColorBlack)\n        end\n        if style.ditherPattern then\n            gfx.setDitherPattern(0.5, style.ditherPattern)\n        else\n            gfx.setDitherPattern(0.5, gfx.image.kDitherTypeNone)\n        end\n",
         );
         output.push_str(
             "        if kind == \"rect\" or kind == \"round_rect\" or kind == \"ellipse\" then\n            local shape_center_x = (params.x or 0) + (params.width or 0) / 2\n            local shape_center_y = (params.y or 0) + (params.height or 0) / 2\n            local scaled_center_x = rotation_center_x + (shape_center_x - rotation_center_x) * scale_x\n            local scaled_center_y = rotation_center_y + (shape_center_y - rotation_center_y) * scale_y\n            local transformed_center_x = rotation_center_x + (scaled_center_x - rotation_center_x) * rotation_cos - (scaled_center_y - rotation_center_y) * rotation_sin + offset_x\n            local transformed_center_y = rotation_center_y + (scaled_center_x - rotation_center_x) * rotation_sin + (scaled_center_y - rotation_center_y) * rotation_cos + offset_y\n            params.x = transformed_center_x - (params.width or 0) * math.abs(scale_x) / 2\n            params.y = transformed_center_y - (params.height or 0) * math.abs(scale_y) / 2\n            params.width = (params.width or 0) * math.abs(scale_x)\n            params.height = (params.height or 0) * math.abs(scale_y)\n        end\n",
@@ -984,6 +1004,17 @@ impl DotStrokeApp {
                 }
             }
         }
+        let last_color = self
+            .doc
+            .layers
+            .iter()
+            .filter(|layer| layer.visible)
+            .flat_map(|layer| layer.objects.iter())
+            .filter_map(Self::last_visible_lua_color)
+            .last();
+        if last_color == Some("white") {
+            output.push_str("    gfx.setColor(gfx.kColorBlack)\n");
+        }
         output.push_str("end\n");
         output
     }
@@ -1009,15 +1040,33 @@ impl DotStrokeApp {
                 &format!("    local lineWidth = style.width or 1\n{}", zero_outline_guard),
             );
         }
+        let mut dither_active = false;
         for layer in &self.doc.layers {
             if layer.visible {
                 for object in &layer.objects {
                     if animation {
                         self.append_lua_object_with_animation_function(&mut output, object);
                     } else {
-                        Self::append_lua_object_simple(&mut output, object);
+                        Self::append_lua_object_simple(
+                            &mut output,
+                            object,
+                            &mut dither_active,
+                        );
                     }
                 }
+            }
+        }
+        if !animation {
+            let last_color = self
+                .doc
+                .layers
+                .iter()
+                .filter(|layer| layer.visible)
+                .flat_map(|layer| layer.objects.iter())
+                .filter_map(Self::last_visible_lua_color)
+                .last();
+            if last_color == Some("white") {
+                let _ = writeln!(output, "gfx.setColor(gfx.kColorBlack)");
             }
         }
         output
@@ -1195,6 +1244,10 @@ impl DotStrokeApp {
             return;
         }
 
+        // Adding one painter shape per pixel is very expensive in egui. Build a
+        // single mesh instead; the rasterization work stays the same, but the
+        // number of shapes submitted to the painter drops from O(pixels) to 1.
+        let mut mesh = egui::Mesh::default();
         for y in min_y..=max_y {
             for x in min_x..=max_x {
                 let sample = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
@@ -1284,9 +1337,12 @@ impl DotStrokeApp {
                 {
                     let pixel =
                         Rect::from_min_size(Pos2::new(x as f32, y as f32), Vec2::splat(1.0));
-                    painter.rect_filled(pixel, 0.0, color);
+                    mesh.add_colored_rect(pixel, color);
                 }
             }
+        }
+        if !mesh.indices.is_empty() {
+            painter.add(egui::Shape::mesh(mesh));
         }
     }
 
@@ -1739,6 +1795,44 @@ impl DotStrokeApp {
                 painter.circle_stroke(preview.center(), 1.8, stroke);
             }
         }
+    }
+
+    fn vector_visibility_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(
+                config::ui::VECTOR_VISIBILITY_WIDTH,
+                config::ui::VECTOR_ROW_HEIGHT,
+            ),
+            Sense::click(),
+        );
+        let painter = ui.painter_at(rect);
+        let center = rect.center();
+        let half_width = 8.0;
+        let half_height = 5.0;
+        let left = Pos2::new(center.x - half_width, center.y);
+        let right = Pos2::new(center.x + half_width, center.y);
+        let top = Pos2::new(center.x, center.y - half_height);
+        let bottom = Pos2::new(center.x, center.y + half_height);
+        let stroke = Stroke::new(1.5, ui.visuals().text_color());
+
+        if visible {
+            painter.line_segment([left, top], stroke);
+            painter.line_segment([top, right], stroke);
+            painter.line_segment([right, bottom], stroke);
+            painter.line_segment([bottom, left], stroke);
+            painter.circle_filled(center, 2.5, ui.visuals().text_color());
+        } else {
+            painter.line_segment([left, right], stroke);
+            painter.line_segment(
+                [
+                    Pos2::new(left.x + 1.0, left.y + 6.0),
+                    Pos2::new(right.x - 1.0, right.y - 6.0),
+                ],
+                stroke,
+            );
+        }
+
+        response.on_hover_text(if visible { "Visible" } else { "Hidden" })
     }
 
     fn dither_icon(
@@ -2469,6 +2563,7 @@ impl DotStrokeApp {
         if self.pixel_preview {
             let pixels = self.pixel_preview_with_background(Color32::WHITE, false);
             let width = self.doc.target.width.max(1) as usize;
+            let mut mesh = egui::Mesh::default();
             for (index, color) in pixels.into_iter().enumerate() {
                 let x = index % width;
                 let y = index / width;
@@ -2479,7 +2574,10 @@ impl DotStrokeApp {
                     ),
                     Vec2::splat(self.zoom),
                 );
-                painter.rect_filled(pixel_rect, 0.0, color);
+                mesh.add_colored_rect(pixel_rect, color);
+            }
+            if !mesh.indices.is_empty() {
+                painter.add(egui::Shape::mesh(mesh));
             }
         } else {
             for layer in &self.doc.layers {
@@ -2944,6 +3042,7 @@ impl eframe::App for DotStrokeApp {
                     }
                 }
             }
+
             let mut dither_pattern = selected_style
                 .as_ref()
                 .map(|style| style.dither_pattern.clone())
@@ -3081,6 +3180,7 @@ impl eframe::App for DotStrokeApp {
                 let mut reorder_request = None;
                 let mut drag_target = None;
                 let mut drag_stopped = false;
+                let mut visibility_toggle = None;
                 egui::ScrollArea::vertical()
                     .min_scrolled_height(config::ui::VECTOR_LIST_MIN_HEIGHT)
                     .max_height(config::ui::VECTOR_LIST_MIN_HEIGHT)
@@ -3107,6 +3207,9 @@ impl eframe::App for DotStrokeApp {
                                         egui::Label::new("≡").selectable(false),
                                     );
                                     drag_response.clone().on_hover_text("Drag to reorder");
+                                    if Self::vector_visibility_button(ui, object.visible).clicked() {
+                                        visibility_toggle = Some(index);
+                                    }
                                     Self::vector_row_icon(ui, &object, is_selected);
                                     if ui.selectable_label(is_selected, name).clicked() {
                                         clicked = true;
@@ -3125,26 +3228,51 @@ impl eframe::App for DotStrokeApp {
                                     }
                                 })
                                 .response;
-                            let row_drag_rect = egui::Rect::from_min_max(
-                                    row_response.rect.min,
+                            let row_left = row_response.rect.left();
+                            let row_top = row_response.rect.top();
+                            let row_bottom = row_response.rect.bottom();
+                            let handle_rect = egui::Rect::from_min_max(
+                                egui::pos2(row_left, row_top),
                                 egui::pos2(
-                                    (row_response.rect.right() - config::ui::VECTOR_ROW_ACTION_WIDTH)
-                                        .max(row_response.rect.left()),
-                                    row_response.rect.bottom(),
+                                    row_left + config::ui::VECTOR_DRAG_HANDLE_WIDTH,
+                                    row_bottom,
                                 ),
                             );
-                            let row_drag_response = ui.interact(
-                                row_drag_rect,
-                                ui.id().with(("vector_row_drag", index)),
+                            let content_rect = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    row_left
+                                        + config::ui::VECTOR_DRAG_HANDLE_WIDTH
+                                        + config::ui::VECTOR_VISIBILITY_WIDTH,
+                                    row_top,
+                                ),
+                                egui::pos2(
+                                    (row_response.rect.right()
+                                        - config::ui::VECTOR_ROW_ACTION_WIDTH)
+                                        .max(row_left),
+                                    row_bottom,
+                                ),
+                            );
+                            let handle_drag_response = ui.interact(
+                                handle_rect,
+                                ui.id().with(("vector_handle_drag", index)),
                                 egui::Sense::click_and_drag(),
                             );
-                            if row_drag_response.drag_started() {
+                            let content_drag_response = ui.interact(
+                                content_rect,
+                                ui.id().with(("vector_content_drag", index)),
+                                egui::Sense::click_and_drag(),
+                            );
+                            if handle_drag_response.drag_started()
+                                || content_drag_response.drag_started()
+                            {
                                 self.dragging_vector = Some(index);
                                 self.selected = Some((self.current_layer, index));
                                 self.selected_point = None;
                                 self.tool = "select".into();
                             }
-                            if row_drag_response.drag_stopped() {
+                            if handle_drag_response.drag_stopped()
+                                || content_drag_response.drag_stopped()
+                            {
                                 drag_stopped = true;
                             }
                             if self.dragging_vector.is_some()
@@ -3157,7 +3285,10 @@ impl eframe::App for DotStrokeApp {
                             {
                                 drag_target = Some(index);
                             }
-                            if clicked || row_drag_response.clicked() {
+                            if clicked
+                                || handle_drag_response.clicked()
+                                || content_drag_response.clicked()
+                            {
                                 self.selected = Some((self.current_layer, index));
                                 self.selected_point = None;
                                 self.tool = "select".into();
@@ -3171,6 +3302,22 @@ impl eframe::App for DotStrokeApp {
                         }
                     } else {
                         self.dragging_vector = None;
+                    }
+                }
+                if let Some(object_index) = visibility_toggle {
+                    self.save_history();
+                    if let Some(object) = self
+                        .doc
+                        .layers
+                        .get_mut(self.current_layer)
+                        .and_then(|layer| layer.objects.get_mut(object_index))
+                    {
+                        object.visible = !object.visible;
+                        self.status = if object.visible {
+                            "Vector visible".into()
+                        } else {
+                            "Vector hidden".into()
+                        };
                     }
                 }
                 if let Some((from, to)) = reorder_request {
@@ -3255,6 +3402,38 @@ impl eframe::App for DotStrokeApp {
                                 }
                             }
                             self.status = "Control point updated".into();
+                        }
+                    }
+                }
+
+                let selected_fill_state = self
+                    .selected
+                    .and_then(|(layer_index, object_index)| {
+                        self.doc
+                            .layers
+                            .get(layer_index)
+                            .and_then(|layer| layer.objects.get(object_index))
+                    })
+                    .map(|object| (object.kind.clone(), object.style.fill));
+                if let Some((kind, mut fill)) = selected_fill_state {
+                    if matches!(kind.as_str(), "rect" | "round_rect" | "ellipse" | "polygon") {
+                        if ui.checkbox(&mut fill, "Fill").changed() {
+                            if let Some((layer_index, object_index)) = self.selected {
+                                self.save_history();
+                                if let Some(object) = self
+                                    .doc
+                                    .layers
+                                    .get_mut(layer_index)
+                                    .and_then(|layer| layer.objects.get_mut(object_index))
+                                {
+                                    object.style.fill = fill;
+                                    self.status = if fill {
+                                        "Fill enabled".into()
+                                    } else {
+                                        "Fill disabled".into()
+                                    };
+                                }
+                            }
                         }
                     }
                 }

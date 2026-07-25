@@ -23,6 +23,8 @@ pub mod ui {
     pub const VECTOR_ROW_HEIGHT: f32 = 30.0;
     // ドラッグハンドルの幅
     pub const VECTOR_DRAG_HANDLE_WIDTH: f32 = 32.0;
+    // 表示/非表示ボタンの幅
+    pub const VECTOR_VISIBILITY_WIDTH: f32 = 28.0;
     // 行末の上下ボタン領域。ここを除いたアイコン・名前部分がドラッグ対象
     pub const VECTOR_ROW_ACTION_WIDTH: f32 = 70.0;
 
