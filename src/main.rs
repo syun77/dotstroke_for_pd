@@ -59,9 +59,15 @@ struct DotStrokeApp {
     current_layer: usize,
     status: String,
     history: History,
+    saved_document: Document,
+    close_dialog: bool,
+    allow_close: bool,
     new_dialog: bool,
+    resolution_dialog: bool,
     new_width: String,
     new_height: String,
+    resolution_width: i32,
+    resolution_height: i32,
     current_file: Option<PathBuf>,
     native_menu: ui::NativeMenu,
     dither_icons: HashMap<String, egui::TextureHandle>,
@@ -98,9 +104,15 @@ impl Default for DotStrokeApp {
             current_layer: 0,
             status: "Ready".into(),
             history: History::default(),
+            saved_document: Document::default(),
+            close_dialog: false,
+            allow_close: false,
             new_dialog: false,
+            resolution_dialog: false,
             new_width: DEFAULT_WIDTH.to_string(),
             new_height: DEFAULT_HEIGHT.to_string(),
+            resolution_width: DEFAULT_WIDTH,
+            resolution_height: DEFAULT_HEIGHT,
             current_file: None,
             native_menu: ui::NativeMenu::new(),
             dither_icons: HashMap::new(),
@@ -148,6 +160,10 @@ impl DotStrokeApp {
         self.history.save(&self.doc);
     }
 
+    fn document_is_dirty(&self) -> bool {
+        serde_json::to_string(&self.doc).ok() != serde_json::to_string(&self.saved_document).ok()
+    }
+
     fn undo_document(&mut self) {
         if let Some(previous) = self.history.undo(&self.doc) {
             self.doc = previous;
@@ -180,6 +196,12 @@ impl DotStrokeApp {
         self.new_dialog = true;
     }
 
+    fn begin_change_resolution(&mut self) {
+        self.resolution_width = self.doc.target.width.clamp(8, 400);
+        self.resolution_height = self.doc.target.height.clamp(8, 400);
+        self.resolution_dialog = true;
+    }
+
     fn load_json_document(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
@@ -188,6 +210,7 @@ impl DotStrokeApp {
             match io::load_document(&path) {
                 Ok(doc) => {
                     self.save_history();
+                    self.saved_document = doc.clone();
                     self.doc = doc;
                     self.current_file = Some(path.clone());
                     self.pending.clear();
@@ -209,6 +232,7 @@ impl DotStrokeApp {
         if let Some(path) = path {
             match io::save_document(&path, &self.doc) {
                 Ok(()) => {
+                    self.saved_document = self.doc.clone();
                     self.current_file = Some(path.clone());
                     self.status = format!("Saved {}", path.display());
                 }
@@ -3032,6 +3056,12 @@ impl eframe::App for DotStrokeApp {
         #[cfg(target_os = "macos")]
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
+        let close_requested = ui.input(|input| input.viewport().close_requested());
+        if close_requested && !self.allow_close && self.document_is_dirty() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_dialog = true;
+        }
         let main_focused = ui.input(|input| input.viewport().focused.unwrap_or(false));
         if main_focused && !self.main_was_focused && self.reference_window {
             ui.ctx().send_viewport_cmd_to(
@@ -3156,6 +3186,11 @@ impl eframe::App for DotStrokeApp {
                         self.save_history();
                         self.doc.target.width = 400;
                         self.doc.target.height = 240;
+                        self.last_fitted_target = None;
+                        ui.close();
+                    }
+                    if ui.button("Change Resolution…").clicked() {
+                        self.begin_change_resolution();
                         ui.close();
                     }
                 });
@@ -3687,6 +3722,89 @@ impl eframe::App for DotStrokeApp {
             ui.separator();
             self.draw_canvas(ui);
         });
+        if self.close_dialog {
+            egui::Window::new("Unsaved Changes")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("There are unsaved changes. Save before quitting?");
+                    ui.horizontal(|ui| {
+                        if ui.button("Save & Quit").clicked() {
+                            self.save_json_document();
+                            if !self.document_is_dirty() {
+                                self.allow_close = true;
+                                self.close_dialog = false;
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        }
+                        if ui.button("Quit Without Saving").clicked() {
+                            self.allow_close = true;
+                            self.close_dialog = false;
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.close_dialog = false;
+                        }
+                    });
+                });
+        }
+        if self.resolution_dialog {
+            let mut apply_resolution = None;
+            egui::Window::new("Change Resolution")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Canvas resolution (8 px increments)");
+                    ui.horizontal(|ui| {
+                        ui.label("Width");
+                        ui.add(
+                            egui::DragValue::new(&mut self.resolution_width)
+                                .range(8..=400)
+                                .speed(8),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.resolution_width, 8..=400)
+                                .step_by(8.0)
+                                .show_value(false),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Height");
+                        ui.add(
+                            egui::DragValue::new(&mut self.resolution_height)
+                                .range(8..=400)
+                                .speed(8),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.resolution_height, 8..=400)
+                                .step_by(8.0)
+                                .show_value(false),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            let width =
+                                ((self.resolution_width.clamp(8, 400) + 4) / 8 * 8).clamp(8, 400);
+                            let height =
+                                ((self.resolution_height.clamp(8, 400) + 4) / 8 * 8).clamp(8, 400);
+                            apply_resolution = Some((width, height));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.resolution_dialog = false;
+                        }
+                    });
+                });
+            if let Some((width, height)) = apply_resolution {
+                self.save_history();
+                self.doc.target.width = width;
+                self.doc.target.height = height;
+                self.last_fitted_target = None;
+                self.resolution_width = width;
+                self.resolution_height = height;
+                self.resolution_dialog = false;
+                self.status = format!("Resolution changed: {} x {}", width, height);
+            }
+        }
         if self.new_dialog {
             let mut create_document = None;
             egui::Window::new("New Document")
