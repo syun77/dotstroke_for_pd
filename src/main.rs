@@ -48,6 +48,7 @@ struct DotStrokeApp {
     pending: Vec<[f32; 2]>,
     selected: Option<(usize, usize)>,
     selected_point: Option<usize>,
+    dragging_vector: Option<usize>,
     current_layer: usize,
     status: String,
     history: History,
@@ -78,6 +79,7 @@ impl Default for DotStrokeApp {
             pending: vec![],
             selected: None,
             selected_point: None,
+            dragging_vector: None,
             current_layer: 0,
             status: "Ready".into(),
             history: History::default(),
@@ -394,6 +396,87 @@ impl DotStrokeApp {
                 self.status = "Vector duplicated".into();
             }
         }
+    }
+
+    fn reorder_vector(&mut self, layer_index: usize, from: usize, to: usize) {
+        let object_count = self
+            .doc
+            .layers
+            .get(layer_index)
+            .map_or(0, |layer| layer.objects.len());
+        if from == to || from >= object_count || to >= object_count {
+            return;
+        }
+
+        self.save_history();
+        let layer = &mut self.doc.layers[layer_index];
+        let object = layer.objects.remove(from);
+        layer.objects.insert(to, object);
+
+        if let Some((selected_layer, selected_index)) = self.selected {
+            if selected_layer == layer_index {
+                let updated_index = if selected_index == from {
+                    to
+                } else if from < to && selected_index > from && selected_index <= to {
+                    selected_index - 1
+                } else if to < from && selected_index >= to && selected_index < from {
+                    selected_index + 1
+                } else {
+                    selected_index
+                };
+                self.selected = Some((selected_layer, updated_index));
+            }
+        }
+        self.status = "Vector order changed".into();
+    }
+
+    fn paint_vector_drag_preview(&self, ctx: &egui::Context) {
+        let Some(object_index) = self.dragging_vector else {
+            return;
+        };
+        let Some(object) = self
+            .doc
+            .layers
+            .get(self.current_layer)
+            .and_then(|layer| layer.objects.get(object_index))
+        else {
+            return;
+        };
+        let Some(pointer_pos) = ctx.input(|input| input.pointer.latest_pos()) else {
+            return;
+        };
+
+        let width = (config::ui::PREVIEW_PANEL_WIDTH
+            - config::ui::VECTOR_ROW_ACTION_WIDTH
+            - 24.0)
+            .max(180.0);
+        let rect = Rect::from_min_size(
+            pointer_pos + egui::vec2(12.0, 12.0),
+            Vec2::new(width, config::ui::VECTOR_ROW_HEIGHT),
+        );
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("vector_drag_preview"),
+        ));
+        painter.rect_filled(
+            rect,
+            4.0,
+            Color32::from_rgba_unmultiplied(40, 40, 40, 190),
+        );
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 180)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.left_center() + egui::vec2(10.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            format!("≡ {}: {}", object_index + 1, object.kind),
+            egui::FontId::proportional(config::ui::FONT_SIZE_BODY),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+        );
+        ctx.request_repaint();
     }
 
     fn commit_pending(&mut self, closed: bool) {
@@ -2900,7 +2983,7 @@ impl eframe::App for DotStrokeApp {
         });
         egui::Panel::right("preview")
             .resizable(false)
-            .default_size(430.0)
+            .default_size(config::ui::PREVIEW_PANEL_WIDTH)
             .show(ui, |ui| {
                 ui.heading("1-bit Preview");
                 self.preview(ui);
@@ -2914,30 +2997,105 @@ impl eframe::App for DotStrokeApp {
                 }
                 ui.separator();
                 ui.heading("Vectors");
-                let vector_rows: Vec<(usize, String, VectorObject)> = self.doc.layers
-                    [self.current_layer]
-                    .objects
-                    .iter()
-                    .enumerate()
-                    .map(|(index, object)| {
-                        (index, format!("{}: {}", index + 1, object.kind), object.clone())
-                    })
-                    .collect();
-                for (index, name, object) in vector_rows {
-                    let is_selected = self.selected == Some((self.current_layer, index));
-                    let mut clicked = false;
-                    ui.horizontal(|ui| {
-                        Self::vector_row_icon(ui, &object, is_selected);
-                        if ui.selectable_label(is_selected, name).clicked() {
-                            clicked = true;
+                let mut reorder_request = None;
+                let mut drag_target = None;
+                let mut drag_stopped = false;
+                egui::ScrollArea::vertical()
+                    .min_scrolled_height(config::ui::VECTOR_LIST_MIN_HEIGHT)
+                    .max_height(config::ui::VECTOR_LIST_MIN_HEIGHT)
+                    .show(ui, |ui| {
+                        let vector_rows: Vec<(usize, String, VectorObject)> = self.doc.layers
+                            [self.current_layer]
+                            .objects
+                            .iter()
+                            .enumerate()
+                            .map(|(index, object)| {
+                                (index, format!("{}: {}", index + 1, object.kind), object.clone())
+                            })
+                            .collect();
+                        for (index, name, object) in vector_rows {
+                            let is_selected = self.selected == Some((self.current_layer, index));
+                            let mut clicked = false;
+                            let row_response = ui
+                                .horizontal(|ui| {
+                                    let drag_response = ui.add_sized(
+                                        [
+                                            config::ui::VECTOR_DRAG_HANDLE_WIDTH,
+                                            config::ui::VECTOR_ROW_HEIGHT,
+                                        ],
+                                        egui::Label::new("≡").selectable(false),
+                                    );
+                                    drag_response.clone().on_hover_text("Drag to reorder");
+                                    Self::vector_row_icon(ui, &object, is_selected);
+                                    if ui.selectable_label(is_selected, name).clicked() {
+                                        clicked = true;
+                                    }
+                                    if ui.small_button("↑").on_hover_text("Move up").clicked()
+                                        && index > 0
+                                    {
+                                        reorder_request = Some((index, index - 1));
+                                    }
+                                    let object_count =
+                                        self.doc.layers[self.current_layer].objects.len();
+                                    if ui.small_button("↓").on_hover_text("Move down").clicked()
+                                        && index + 1 < object_count
+                                    {
+                                        reorder_request = Some((index, index + 1));
+                                    }
+                                })
+                                .response;
+                            let row_drag_rect = egui::Rect::from_min_max(
+                                    row_response.rect.min,
+                                egui::pos2(
+                                    (row_response.rect.right() - config::ui::VECTOR_ROW_ACTION_WIDTH)
+                                        .max(row_response.rect.left()),
+                                    row_response.rect.bottom(),
+                                ),
+                            );
+                            let row_drag_response = ui.interact(
+                                row_drag_rect,
+                                ui.id().with(("vector_row_drag", index)),
+                                egui::Sense::click_and_drag(),
+                            );
+                            if row_drag_response.drag_started() {
+                                self.dragging_vector = Some(index);
+                                self.selected = Some((self.current_layer, index));
+                                self.selected_point = None;
+                                self.tool = "select".into();
+                            }
+                            if row_drag_response.drag_stopped() {
+                                drag_stopped = true;
+                            }
+                            if self.dragging_vector.is_some()
+                                && ui.input(|input| {
+                                    input
+                                        .pointer
+                                        .latest_pos()
+                                        .is_some_and(|position| row_response.rect.contains(position))
+                                })
+                            {
+                                drag_target = Some(index);
+                            }
+                            if clicked || row_drag_response.clicked() {
+                                self.selected = Some((self.current_layer, index));
+                                self.selected_point = None;
+                                self.tool = "select".into();
+                            }
                         }
                     });
-                    if clicked {
-                        self.selected = Some((self.current_layer, index));
-                        self.selected_point = None;
-                        self.tool = "select".into();
+                if drag_stopped || ui.input(|input| input.pointer.any_released()) {
+                    if let (Some(from), Some(to)) = (self.dragging_vector.take(), drag_target) {
+                        if from != to {
+                            reorder_request = Some((from, to));
+                        }
+                    } else {
+                        self.dragging_vector = None;
                     }
                 }
+                if let Some((from, to)) = reorder_request {
+                    self.reorder_vector(self.current_layer, from, to);
+                }
+                self.paint_vector_drag_preview(ui.ctx());
                 ui.horizontal(|ui| {
                     if ui.button("Delete").clicked() {
                         self.delete_selected();
@@ -3099,6 +3257,67 @@ impl eframe::App for DotStrokeApp {
     }
 }
 
+fn configure_fonts(ctx: &egui::Context) {
+    // egui's built-in font is intentionally small and does not contain all
+    // arrows, Japanese characters, or other UI symbols. Add a system CJK font
+    // as a fallback so these glyphs render instead of becoming tofu boxes.
+    const SYSTEM_FONT_CANDIDATES: [&str; 8] = [
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+        "C:\\Windows\\Fonts\\msgothic.ttc",
+        "C:\\Windows\\Fonts\\YuGothR.ttc",
+    ];
+
+    let system_font = SYSTEM_FONT_CANDIDATES.iter().find_map(|path| {
+        fs::read(path)
+            .ok()
+            .map(|bytes| (path.to_string(), bytes))
+    });
+
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some((font_name, font_bytes)) = system_font {
+        fonts
+            .font_data
+            .insert(font_name.clone(), egui::FontData::from_owned(font_bytes).into());
+        for family in [
+            egui::FontFamily::Proportional,
+            egui::FontFamily::Monospace,
+        ] {
+            if let Some(family_fonts) = fonts.families.get_mut(&family) {
+                family_fonts.push(font_name.clone());
+            }
+        }
+    }
+    ctx.set_fonts(fonts);
+
+    ctx.all_styles_mut(|style| {
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::proportional(config::ui::FONT_SIZE_BODY),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Button,
+            egui::FontId::proportional(config::ui::FONT_SIZE_BUTTON),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::proportional(config::ui::FONT_SIZE_HEADING),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            egui::FontId::proportional(config::ui::FONT_SIZE_SMALL),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(config::ui::FONT_SIZE_MONOSPACE),
+        );
+    });
+}
+
 fn main() -> eframe::Result {
     let native_menu = ui::NativeMenu::new();
     native_menu.init();
@@ -3119,6 +3338,7 @@ fn main() -> eframe::Result {
         "DotStroke",
         options,
         Box::new(move |_cc| {
+            configure_fonts(&_cc.egui_ctx);
             let mut app = DotStrokeApp::default();
             app.native_menu = native_menu;
             app.load_dither_icons(&_cc.egui_ctx);

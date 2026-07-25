@@ -13,6 +13,27 @@ pub mod interaction {
     pub const CONTROL_POINT_HIT_RADIUS: f32 = 40.0;
 }
 
+// ■UIレイアウト・フォント関連.
+pub mod ui {
+    // Previewパネルの幅
+    pub const PREVIEW_PANEL_WIDTH: f32 = 520.0;
+    // Vector一覧の最低表示高さ。項目が少なくてもドラッグしやすい領域を確保する
+    pub const VECTOR_LIST_MIN_HEIGHT: f32 = 300.0;
+    // Vector一覧1行の高さ
+    pub const VECTOR_ROW_HEIGHT: f32 = 30.0;
+    // ドラッグハンドルの幅
+    pub const VECTOR_DRAG_HANDLE_WIDTH: f32 = 32.0;
+    // 行末の上下ボタン領域。ここを除いたアイコン・名前部分がドラッグ対象
+    pub const VECTOR_ROW_ACTION_WIDTH: f32 = 70.0;
+
+    // UIの標準フォントサイズ
+    pub const FONT_SIZE_BODY: f32 = 16.0;
+    pub const FONT_SIZE_BUTTON: f32 = 16.0;
+    pub const FONT_SIZE_HEADING: f32 = 21.0;
+    pub const FONT_SIZE_SMALL: f32 = 14.0;
+    pub const FONT_SIZE_MONOSPACE: f32 = 14.0;
+}
+
 // ■色関連.
 pub mod colors {
     use super::Color32;
