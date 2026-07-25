@@ -41,7 +41,7 @@ impl NativeMenu {
             true,
             &[&new_item, &load_item, &save_item, &export_png_item],
         )
-            .expect("failed to create File menu");
+        .expect("failed to create File menu");
         menu.append(&file_menu).expect("failed to append File menu");
         Self {
             menu,

@@ -10,6 +10,7 @@ mod ui;
 use editor::History;
 use model::{Document, Style, VectorObject, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt::Write as _,
     fs,
@@ -30,6 +31,12 @@ const DITHER_PATTERNS: [&str; 11] = [
     "atkinson",
 ];
 const DITHER_ICON_DIR: &str = "assets/dither_icons";
+
+struct ReferenceImage {
+    name: String,
+    texture: egui::TextureHandle,
+    size: [usize; 2],
+}
 
 struct DotStrokeApp {
     doc: Document,
@@ -58,6 +65,14 @@ struct DotStrokeApp {
     current_file: Option<PathBuf>,
     native_menu: ui::NativeMenu,
     dither_icons: HashMap<String, egui::TextureHandle>,
+    reference_window: bool,
+    reference_images: Vec<ReferenceImage>,
+    reference_selected: usize,
+    reference_zoom: f32,
+    reference_pan: Vec2,
+    reference_viewport: Vec2,
+    reference_last_size: Option<[usize; 2]>,
+    main_was_focused: bool,
 }
 
 impl Default for DotStrokeApp {
@@ -89,6 +104,14 @@ impl Default for DotStrokeApp {
             current_file: None,
             native_menu: ui::NativeMenu::new(),
             dither_icons: HashMap::new(),
+            reference_window: false,
+            reference_images: Vec::new(),
+            reference_selected: 0,
+            reference_zoom: 1.0,
+            reference_pan: Vec2::ZERO,
+            reference_viewport: Vec2::new(640.0, 480.0),
+            reference_last_size: None,
+            main_was_focused: false,
         }
     }
 }
@@ -245,6 +268,178 @@ impl DotStrokeApp {
                 egui::TextureOptions::NEAREST,
             );
             self.dither_icons.insert(pattern.into(), texture);
+        }
+    }
+
+    fn add_reference_image(&mut self, ctx: &egui::Context, name: String, bytes: &[u8]) {
+        let Ok(decoded) = image::load_from_memory(bytes) else {
+            self.status = "Unsupported reference image".into();
+            return;
+        };
+        let rgba = decoded.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let texture = ctx.load_texture(
+            format!("reference-{}-{}", self.reference_images.len(), name),
+            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+            egui::TextureOptions::NEAREST,
+        );
+        self.reference_images.push(ReferenceImage {
+            name,
+            texture,
+            size,
+        });
+        self.reference_selected = self.reference_images.len() - 1;
+        self.reference_last_size = None;
+        self.reference_window = true;
+        self.status = "Reference image loaded".into();
+    }
+
+    fn add_reference_clipboard(&mut self, ctx: &egui::Context) {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            self.status = "Clipboard is unavailable".into();
+            return;
+        };
+        let Ok(image) = clipboard.get_image() else {
+            self.status = "Clipboard does not contain an image".into();
+            return;
+        };
+        let rgba = match image.bytes {
+            Cow::Borrowed(bytes) => bytes.to_vec(),
+            Cow::Owned(bytes) => bytes,
+        };
+        let size = [image.width, image.height];
+        let texture = ctx.load_texture(
+            format!("reference-clipboard-{}", self.reference_images.len()),
+            egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
+            egui::TextureOptions::NEAREST,
+        );
+        self.reference_images.push(ReferenceImage {
+            name: "Clipboard image".into(),
+            texture,
+            size,
+        });
+        self.reference_selected = self.reference_images.len() - 1;
+        self.reference_last_size = None;
+        self.reference_window = true;
+        self.status = "Clipboard image loaded".into();
+    }
+
+    fn fit_reference_image(&mut self) {
+        let Some(image) = self.reference_images.get(self.reference_selected) else {
+            return;
+        };
+        let image_size = Vec2::new(image.size[0] as f32, image.size[1] as f32);
+        self.reference_zoom = (self.reference_viewport.x / image_size.x)
+            .min(self.reference_viewport.y / image_size.y)
+            .clamp(0.05, 32.0);
+        self.reference_pan = (self.reference_viewport - image_size * self.reference_zoom) / 2.0;
+        self.reference_last_size = Some(image.size);
+    }
+
+    fn draw_reference_preview(&mut self, ui: &mut egui::Ui) {
+        let dropped_files: Vec<(String, Option<Vec<u8>>)> = ui.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| {
+                    let name = file
+                        .path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "Dropped image".into());
+                    (name, file.bytes.as_ref().map(|bytes| bytes.to_vec()))
+                })
+                .collect()
+        });
+        for (name, bytes) in dropped_files {
+            if let Some(bytes) = bytes {
+                self.add_reference_image(ui.ctx(), name, &bytes);
+            } else if let Some(path) = PathBuf::from(&name).canonicalize().ok() {
+                if let Ok(bytes) = fs::read(&path) {
+                    self.add_reference_image(ui.ctx(), path.display().to_string(), &bytes);
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Open image…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp"])
+                    .pick_file()
+                {
+                    if let Ok(bytes) = fs::read(&path) {
+                        self.add_reference_image(ui.ctx(), path.display().to_string(), &bytes);
+                    }
+                }
+            }
+            if ui.button("Clipboard").clicked() {
+                self.add_reference_clipboard(ui.ctx());
+            }
+            if !self.reference_images.is_empty() {
+                egui::ComboBox::from_id_salt("reference-history")
+                    .selected_text(&self.reference_images[self.reference_selected].name)
+                    .show_ui(ui, |ui| {
+                        for (index, image) in self.reference_images.iter().enumerate() {
+                            if ui
+                                .selectable_value(&mut self.reference_selected, index, &image.name)
+                                .clicked()
+                            {
+                                self.reference_last_size = None;
+                            }
+                        }
+                    });
+                if ui.button("Fit").clicked() {
+                    self.fit_reference_image();
+                }
+                ui.label(format!("{:.0}%", self.reference_zoom * 100.0));
+            }
+        });
+        ui.label("Drop an image here, or drag to pan. Wheel: zoom");
+        let available = ui.available_size().max(Vec2::new(240.0, 180.0));
+        self.reference_viewport = available;
+        let (rect, response) = ui.allocate_exact_size(available, Sense::drag());
+        let painter = ui.painter_at(rect).with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, Color32::from_gray(42));
+        if self
+            .reference_images
+            .get(self.reference_selected)
+            .is_some_and(|image| self.reference_last_size != Some(image.size))
+        {
+            if let Some(image) = self.reference_images.get(self.reference_selected) {
+                let image_size = Vec2::new(image.size[0] as f32, image.size[1] as f32);
+                self.reference_zoom = 1.0;
+                self.reference_pan = (self.reference_viewport - image_size) / 2.0;
+                self.reference_last_size = Some(image.size);
+            }
+        }
+        if let Some(image) = self.reference_images.get(self.reference_selected) {
+            let size = Vec2::new(image.size[0] as f32, image.size[1] as f32) * self.reference_zoom;
+            let image_rect = Rect::from_min_size(rect.left_top() + self.reference_pan, size);
+            Self::draw_transparency_checkerboard(&painter, image_rect, 16.0);
+            painter.image(
+                image.texture.id(),
+                image_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            if response.hovered() {
+                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                if scroll.abs() > 0.0 {
+                    self.reference_zoom =
+                        (self.reference_zoom * (1.0 + scroll.signum() * 0.1)).clamp(0.05, 64.0);
+                }
+            }
+            if response.dragged() {
+                self.reference_pan += ui.input(|input| input.pointer.delta());
+            }
+        } else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Open or drop a reference image",
+                egui::TextStyle::Body.resolve(ui.style()),
+                Color32::LIGHT_GRAY,
+            );
         }
     }
 
@@ -465,9 +660,7 @@ impl DotStrokeApp {
             return;
         };
 
-        let width = (config::ui::PREVIEW_PANEL_WIDTH
-            - config::ui::VECTOR_ROW_ACTION_WIDTH
-            - 24.0)
+        let width = (config::ui::PREVIEW_PANEL_WIDTH - config::ui::VECTOR_ROW_ACTION_WIDTH - 24.0)
             .max(180.0);
         let rect = Rect::from_min_size(
             pointer_pos + egui::vec2(12.0, 12.0),
@@ -477,11 +670,7 @@ impl DotStrokeApp {
             egui::Order::Tooltip,
             egui::Id::new("vector_drag_preview"),
         ));
-        painter.rect_filled(
-            rect,
-            4.0,
-            Color32::from_rgba_unmultiplied(40, 40, 40, 190),
-        );
+        painter.rect_filled(rect, 4.0, Color32::from_rgba_unmultiplied(40, 40, 40, 190));
         painter.rect_stroke(
             rect,
             4.0,
@@ -545,7 +734,10 @@ impl DotStrokeApp {
             ),
             format!("blend = \"{}\"", object.style.blend),
             format!("cap = {}", Self::lua_cap_style(&object.style.cap)),
-            format!("fill = {}", if object.style.fill { "true" } else { "false" }),
+            format!(
+                "fill = {}",
+                if object.style.fill { "true" } else { "false" }
+            ),
             format!("radius = {}", object.style.radius.max(0)),
         ];
         if let Some(pattern) = export::lua_dither_pattern(&object.style.dither_pattern) {
@@ -630,8 +822,7 @@ impl DotStrokeApp {
                 let _ = writeln!(
                     output,
                     "drawObject(\"polygon\", {{ points = {{ {} }} }}, {{ {} }}, outline_width)",
-                    points,
-                    style_fields
+                    points, style_fields
                 );
             }
             "line" | "polyline" | "path" if object.points.len() >= 2 => {
@@ -1037,7 +1228,10 @@ impl DotStrokeApp {
             );
             output = output.replace(
                 "    local lineWidth = style.width or 1\n",
-                &format!("    local lineWidth = style.width or 1\n{}", zero_outline_guard),
+                &format!(
+                    "    local lineWidth = style.width or 1\n{}",
+                    zero_outline_guard
+                ),
             );
         }
         let mut dither_active = false;
@@ -1047,11 +1241,7 @@ impl DotStrokeApp {
                     if animation {
                         self.append_lua_object_with_animation_function(&mut output, object);
                     } else {
-                        Self::append_lua_object_simple(
-                            &mut output,
-                            object,
-                            &mut dither_active,
-                        );
+                        Self::append_lua_object_simple(&mut output, object, &mut dither_active);
                     }
                 }
             }
@@ -1259,8 +1449,10 @@ impl DotStrokeApp {
                         let right = pts[0].x.max(pts[1].x);
                         let top = pts[0].y.min(pts[1].y);
                         let bottom = pts[0].y.max(pts[1].y);
-                        let inside =
-                            sample.x >= left && sample.x <= right && sample.y >= top && sample.y <= bottom;
+                        let inside = sample.x >= left
+                            && sample.x <= right
+                            && sample.y >= top
+                            && sample.y <= bottom;
                         let edge_distance = (sample.x - left)
                             .min(right - sample.x)
                             .min((sample.y - top).min(bottom - sample.y));
@@ -1273,8 +1465,8 @@ impl DotStrokeApp {
                         let bottom = pts[0].y.max(pts[1].y);
                         let half_w = ((right - left) / 2.0).max(0.0);
                         let half_h = ((bottom - top) / 2.0).max(0.0);
-                        let radius = (object.style.radius.max(0) as f32 * zoom)
-                            .min(half_w.min(half_h));
+                        let radius =
+                            (object.style.radius.max(0) as f32 * zoom).min(half_w.min(half_h));
                         let center_x = (left + right) / 2.0;
                         let center_y = (top + bottom) / 2.0;
                         let qx = (sample.x - center_x).abs() - (half_w - radius);
@@ -1379,7 +1571,7 @@ impl DotStrokeApp {
                     painter.circle_stroke(cursor, 6.0, preview_stroke);
                 }
             }
-                "polygon" | "fill_polygon" => {
+            "polygon" | "fill_polygon" => {
                 if let Some(point) = self.pending.last() {
                     painter
                         .line_segment([self.doc_to_screen(rect, *point), cursor], preview_stroke);
@@ -1744,7 +1936,10 @@ impl DotStrokeApp {
             egui::StrokeKind::Inside,
         );
         let stroke_color = draw_color;
-        let stroke = Stroke::new((object.style.width.max(1) as f32 * 0.45).clamp(0.9, 1.8), stroke_color);
+        let stroke = Stroke::new(
+            (object.style.width.max(1) as f32 * 0.45).clamp(0.9, 1.8),
+            stroke_color,
+        );
 
         match object.kind.as_str() {
             "pixel" => {
@@ -1777,7 +1972,11 @@ impl DotStrokeApp {
             }
             "polygon" if points.len() >= 3 => {
                 if object.style.fill {
-                    painter.add(egui::Shape::convex_polygon(points.clone(), draw_color, stroke));
+                    painter.add(egui::Shape::convex_polygon(
+                        points.clone(),
+                        draw_color,
+                        stroke,
+                    ));
                 } else {
                     painter.add(egui::Shape::closed_line(points.clone(), stroke));
                 }
@@ -2029,8 +2228,7 @@ impl DotStrokeApp {
                 if px >= 0 && py >= 0 && (px as usize) < width && (py as usize) < height {
                     if Self::dither_allows_pixel(dither_pattern, px as usize, py as usize) {
                         let index = py as usize * width + px as usize;
-                        pixels[index] =
-                            Self::apply_raster_blend_color(pixels[index], color, blend);
+                        pixels[index] = Self::apply_raster_blend_color(pixels[index], color, blend);
                     }
                 }
             }
@@ -2697,11 +2895,7 @@ impl DotStrokeApp {
             for (index, point) in self.pending.iter().enumerate() {
                 let screen_point = self.doc_to_screen(rect, *point);
                 let radius = if index == 0 { 7.0 } else { 5.0 };
-                painter.circle_filled(
-                    screen_point,
-                    radius,
-                    config::colors::guide_fill(),
-                );
+                painter.circle_filled(screen_point, radius, config::colors::guide_fill());
                 painter.circle_stroke(screen_point, radius, guide_stroke);
             }
         }
@@ -2742,8 +2936,8 @@ impl DotStrokeApp {
                     let drag_start = ui
                         .input(|input| input.pointer.press_origin())
                         .or_else(|| response.interact_pointer_pos());
-                    self.selected_point = drag_start
-                        .and_then(|position| self.hit_test_control_point(rect, position));
+                    self.selected_point =
+                        drag_start.and_then(|position| self.hit_test_control_point(rect, position));
                     self.save_history();
                 }
                 let delta = ui.input(|i| i.pointer.delta()) / self.zoom;
@@ -2776,14 +2970,8 @@ impl DotStrokeApp {
                     "polygon" | "fill_polygon" => {
                         self.pending.push(p);
                     }
-                    "polyline"
-                    | "path"
-                    | "rect"
-                    | "fill_rect"
-                    | "round_rect"
-                    | "fill_round_rect"
-                    | "ellipse"
-                    | "fill_circle" => {
+                    "polyline" | "path" | "rect" | "fill_rect" | "round_rect"
+                    | "fill_round_rect" | "ellipse" | "fill_circle" => {
                         self.pending.push(p);
                         if matches!(
                             self.tool.as_str(),
@@ -2793,8 +2981,7 @@ impl DotStrokeApp {
                                 | "fill_round_rect"
                                 | "ellipse"
                                 | "fill_circle"
-                        )
-                            && self.pending.len() == 2
+                        ) && self.pending.len() == 2
                         {
                             self.commit_pending(false);
                         }
@@ -2823,7 +3010,10 @@ impl DotStrokeApp {
             let x = index % width;
             let y = index / width;
             let pixel_rect = Rect::from_min_size(
-                Pos2::new(rect.left() + x as f32 * scale, rect.top() + y as f32 * scale),
+                Pos2::new(
+                    rect.left() + x as f32 * scale,
+                    rect.top() + y as f32 * scale,
+                ),
                 Vec2::splat(scale),
             );
             painter.rect_filled(pixel_rect, 0.0, color);
@@ -2842,6 +3032,14 @@ impl eframe::App for DotStrokeApp {
         #[cfg(target_os = "macos")]
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
+        let main_focused = ui.input(|input| input.viewport().focused.unwrap_or(false));
+        if main_focused && !self.main_was_focused && self.reference_window {
+            ui.ctx().send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of("reference_preview"),
+                egui::ViewportCommand::Focus,
+            );
+        }
+        self.main_was_focused = main_focused;
         let (undo_pressed, redo_pressed) = ui.input(|input| {
             let modifier = input.modifiers.ctrl || input.modifiers.command;
             (
@@ -2855,6 +3053,37 @@ impl eframe::App for DotStrokeApp {
         if redo_pressed {
             self.redo_document();
         }
+        let paste_reference = ui.input(|input| {
+            let modifier = input.modifiers.ctrl || input.modifiers.command;
+            modifier && input.key_pressed(egui::Key::V)
+        });
+        if paste_reference {
+            self.add_reference_clipboard(ui.ctx());
+        }
+        let dropped_files: Vec<(String, Option<Vec<u8>>)> = ui.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| {
+                    let name = file
+                        .path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "Dropped image".into());
+                    (name, file.bytes.as_ref().map(|bytes| bytes.to_vec()))
+                })
+                .collect()
+        });
+        for (name, bytes) in dropped_files {
+            if let Some(bytes) = bytes {
+                self.add_reference_image(ui.ctx(), name, &bytes);
+            } else if let Some(path) = PathBuf::from(&name).canonicalize().ok() {
+                if let Ok(bytes) = fs::read(&path) {
+                    self.add_reference_image(ui.ctx(), path.display().to_string(), &bytes);
+                }
+            }
+        }
         let (native_new, native_load, native_save, native_export_png) = self.native_menu.actions();
         let (
             shortcut_new,
@@ -2862,19 +3091,16 @@ impl eframe::App for DotStrokeApp {
             shortcut_save,
             shortcut_export_png,
             shortcut_copy_playdate_lua,
-        ) =
-            ui.input(|input| {
-                let modifier = input.modifiers.ctrl || input.modifiers.command;
-                (
-                    modifier && input.key_pressed(egui::Key::N), // 新規作成.
-                    modifier && input.key_pressed(egui::Key::O), // JSON読み込み.
-                    modifier && input.key_pressed(egui::Key::S), // JSON保存.
-                    modifier
-                        && input.modifiers.shift
-                        && input.key_pressed(egui::Key::E), // PNGエクスポート.
-                    modifier && input.key_pressed(egui::Key::P), // Copy Playdate Lua.
-                )
-            });
+        ) = ui.input(|input| {
+            let modifier = input.modifiers.ctrl || input.modifiers.command;
+            (
+                modifier && input.key_pressed(egui::Key::N), // 新規作成.
+                modifier && input.key_pressed(egui::Key::O), // JSON読み込み.
+                modifier && input.key_pressed(egui::Key::S), // JSON保存.
+                modifier && input.modifiers.shift && input.key_pressed(egui::Key::E), // PNGエクスポート.
+                modifier && input.key_pressed(egui::Key::P), // Copy Playdate Lua.
+            )
+        });
         if native_new || shortcut_new {
             self.begin_new_document();
         }
@@ -2911,6 +3137,9 @@ impl eframe::App for DotStrokeApp {
                         ui.close();
                     }
                 });
+                if ui.button("Reference Preview").clicked() {
+                    self.reference_window = true;
+                }
                 ui.menu_button("Resolution", |ui| {
                     ui.label(format!(
                         "Current: {} x {}",
@@ -3106,9 +3335,7 @@ impl eframe::App for DotStrokeApp {
             }
 
             if matches!(self.tool.as_str(), "round_rect" | "fill_round_rect")
-                || selected_style
-                    .as_ref()
-                    .is_some()
+                || selected_style.as_ref().is_some()
                     && matches!(selected_kind.as_deref(), Some("round_rect"))
             {
                 let mut radius = selected_style
@@ -3191,7 +3418,11 @@ impl eframe::App for DotStrokeApp {
                             .iter()
                             .enumerate()
                             .map(|(index, object)| {
-                                (index, format!("{}: {}", index + 1, object.kind), object.clone())
+                                (
+                                    index,
+                                    format!("{}: {}", index + 1, object.kind),
+                                    object.clone(),
+                                )
                             })
                             .collect();
                         for (index, name, object) in vector_rows {
@@ -3207,7 +3438,8 @@ impl eframe::App for DotStrokeApp {
                                         egui::Label::new("≡").selectable(false),
                                     );
                                     drag_response.clone().on_hover_text("Drag to reorder");
-                                    if Self::vector_visibility_button(ui, object.visible).clicked() {
+                                    if Self::vector_visibility_button(ui, object.visible).clicked()
+                                    {
                                         visibility_toggle = Some(index);
                                     }
                                     Self::vector_row_icon(ui, &object, is_selected);
@@ -3277,10 +3509,9 @@ impl eframe::App for DotStrokeApp {
                             }
                             if self.dragging_vector.is_some()
                                 && ui.input(|input| {
-                                    input
-                                        .pointer
-                                        .latest_pos()
-                                        .is_some_and(|position| row_response.rect.contains(position))
+                                    input.pointer.latest_pos().is_some_and(|position| {
+                                        row_response.rect.contains(position)
+                                    })
                                 })
                             {
                                 drag_target = Some(index);
@@ -3364,18 +3595,10 @@ impl eframe::App for DotStrokeApp {
                                 let mut x = point[0];
                                 let mut y = point[1];
                                 let x_changed = ui
-                                    .add(
-                                        egui::DragValue::new(&mut x)
-                                            .speed(0.1)
-                                            .prefix("x: "),
-                                    )
+                                    .add(egui::DragValue::new(&mut x).speed(0.1).prefix("x: "))
                                     .changed();
                                 let y_changed = ui
-                                    .add(
-                                        egui::DragValue::new(&mut y)
-                                            .speed(0.1)
-                                            .prefix("y: "),
-                                    )
+                                    .add(egui::DragValue::new(&mut y).speed(0.1).prefix("y: "))
                                     .changed();
                                 if x_changed || y_changed {
                                     point_edits.push((index, [x, y]));
@@ -3440,25 +3663,25 @@ impl eframe::App for DotStrokeApp {
             });
         egui::containers::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                    if ui.button("Undo").clicked() {
-                        self.undo_document();
-                    }
-                    if ui.button("Redo").clicked() {
-                        self.redo_document();
-                    }
-                    ui.separator();
-                    ui.label(format!("Zoom: {:.2}x", self.zoom));
-                    if ui.button("-").clicked() {
-                        self.zoom = (self.zoom - 0.25).max(0.25);
-                    }
-                    if ui.button("+").clicked() {
-                        self.zoom = (self.zoom + 0.25).min(self.max_zoom());
-                    }
-                    if ui.button("Reset").clicked() {
-                        self.zoom = 2.0;
-                        self.pan = Vec2::ZERO;
-                    }
-                    ui.separator();
+                if ui.button("Undo").clicked() {
+                    self.undo_document();
+                }
+                if ui.button("Redo").clicked() {
+                    self.redo_document();
+                }
+                ui.separator();
+                ui.label(format!("Zoom: {:.2}x", self.zoom));
+                if ui.button("-").clicked() {
+                    self.zoom = (self.zoom - 0.25).max(0.25);
+                }
+                if ui.button("+").clicked() {
+                    self.zoom = (self.zoom + 0.25).min(self.max_zoom());
+                }
+                if ui.button("Reset").clicked() {
+                    self.zoom = 2.0;
+                    self.pan = Vec2::ZERO;
+                }
+                ui.separator();
                 ui.checkbox(&mut self.pixel_preview, "Pixel preview");
             });
             ui.separator();
@@ -3514,6 +3737,22 @@ impl eframe::App for DotStrokeApp {
                 self.status = format!("New document: {} x {}", width, height);
             }
         }
+        if self.reference_window {
+            let viewport_id = egui::ViewportId::from_hash_of("reference_preview");
+            ui.ctx().show_viewport_immediate(
+                viewport_id,
+                egui::ViewportBuilder::default()
+                    .with_title("Reference Preview")
+                    .with_inner_size([720.0, 620.0])
+                    .with_min_inner_size([360.0, 260.0]),
+                |ui, _class| {
+                    if ui.input(|input| input.viewport().close_requested()) {
+                        self.reference_window = false;
+                    }
+                    self.draw_reference_preview(ui);
+                },
+            );
+        }
     }
 }
 
@@ -3532,21 +3771,17 @@ fn configure_fonts(ctx: &egui::Context) {
         "C:\\Windows\\Fonts\\YuGothR.ttc",
     ];
 
-    let system_font = SYSTEM_FONT_CANDIDATES.iter().find_map(|path| {
-        fs::read(path)
-            .ok()
-            .map(|bytes| (path.to_string(), bytes))
-    });
+    let system_font = SYSTEM_FONT_CANDIDATES
+        .iter()
+        .find_map(|path| fs::read(path).ok().map(|bytes| (path.to_string(), bytes)));
 
     let mut fonts = egui::FontDefinitions::default();
     if let Some((font_name, font_bytes)) = system_font {
-        fonts
-            .font_data
-            .insert(font_name.clone(), egui::FontData::from_owned(font_bytes).into());
-        for family in [
-            egui::FontFamily::Proportional,
-            egui::FontFamily::Monospace,
-        ] {
+        fonts.font_data.insert(
+            font_name.clone(),
+            egui::FontData::from_owned(font_bytes).into(),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             if let Some(family_fonts) = fonts.families.get_mut(&family) {
                 family_fonts.push(font_name.clone());
             }
