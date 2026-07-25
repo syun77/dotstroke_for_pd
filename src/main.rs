@@ -1,4 +1,5 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+mod config;
 mod editor;
 mod export;
 mod io;
@@ -614,7 +615,7 @@ impl DotStrokeApp {
             .collect();
         let color = match object.style.color.as_str() {
             "white" => Color32::GRAY,
-            "clear" => Color32::from_rgb(60, 150, 255),
+            "clear" => config::colors::clear_color(),
             _ => Color32::BLACK,
         };
         let stroke = Stroke::new((object.style.width.max(1) as f32) * zoom, color);
@@ -685,8 +686,8 @@ impl DotStrokeApp {
 
         let cursor = self.snap(self.screen_to_doc(rect, cursor));
         let cursor = self.doc_to_screen(rect, cursor);
-        let preview_color = Color32::from_rgba_unmultiplied(255, 0, 100, 105);
-        let preview_fill = Color32::from_rgba_unmultiplied(255, 0, 100, 20);
+        let preview_color = config::colors::preview_stroke();
+        let preview_fill = config::colors::preview_fill();
         let preview_stroke = Stroke::new(
             (self.width.max(1) as f32 * self.zoom).max(1.0),
             preview_color,
@@ -941,21 +942,18 @@ impl DotStrokeApp {
             visuals.bg_stroke,
             egui::StrokeKind::Outside,
         );
-        let swatch = rect.shrink(8.0);
+        let center = rect.center();
+        let radius = 9.0;
         match color {
             "black" => {
-                painter.rect_filled(swatch, 2.0, Color32::BLACK);
+                painter.circle_filled(center, radius, Color32::BLACK);
             }
             "white" => {
-                painter.rect_filled(swatch, 2.0, Color32::WHITE);
-                painter.rect_stroke(
-                    swatch,
-                    2.0,
-                    Stroke::new(1.0, Color32::DARK_GRAY),
-                    egui::StrokeKind::Inside,
-                );
+                painter.circle_filled(center, radius, Color32::WHITE);
+                painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::DARK_GRAY));
             }
             "clear" => {
+                let swatch = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
                 let half = swatch.width() / 2.0;
                 for row in 0..2 {
                     for column in 0..2 {
@@ -970,22 +968,17 @@ impl DotStrokeApp {
                             cell,
                             0.0,
                             if (row + column) % 2 == 0 {
-                                Color32::from_gray(215)
+                                config::colors::dither_swatch_checker_dark()
                             } else {
                                 Color32::WHITE
                             },
                         );
                     }
                 }
+                painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::DARK_GRAY));
                 painter.line_segment(
                     [swatch.left_top(), swatch.right_bottom()],
-                    Stroke::new(1.5, Color32::from_rgb(60, 150, 255)),
-                );
-                painter.rect_stroke(
-                    swatch,
-                    2.0,
-                    Stroke::new(1.0, Color32::DARK_GRAY),
-                    egui::StrokeKind::Inside,
+                    Stroke::new(1.5, config::colors::dither_swatch_diagonal()),
                 );
             }
             _ => {}
@@ -1003,7 +996,7 @@ impl DotStrokeApp {
         let painter = ui.painter_at(rect);
         let visuals = ui.style().interact_selectable(&response, selected);
         let frame_stroke = if selected {
-            Stroke::new(1.8, Color32::from_rgb(255, 180, 70))
+            Stroke::new(1.8, config::colors::dither_selected_border())
         } else {
             visuals.bg_stroke
         };
@@ -1509,9 +1502,9 @@ impl DotStrokeApp {
                     Stroke::new(
                         if is_major { 1.0 } else { 0.5 },
                         if is_major {
-                            Color32::from_gray(205)
+                            config::colors::grid_major()
                         } else {
-                            Color32::from_gray(232)
+                            config::colors::grid_minor()
                         },
                     ),
                 );
@@ -1527,9 +1520,9 @@ impl DotStrokeApp {
                     Stroke::new(
                         if is_major { 1.0 } else { 0.5 },
                         if is_major {
-                            Color32::from_gray(205)
+                            config::colors::grid_major()
                         } else {
-                            Color32::from_gray(232)
+                            config::colors::grid_minor()
                         },
                     ),
                 );
@@ -1580,7 +1573,7 @@ impl DotStrokeApp {
                                     painter.circle_filled(
                                         self.doc_to_screen(rect, *point),
                                         radius,
-                                        Color32::from_rgba_unmultiplied(255, 0, 100, 70),
+                                        config::colors::selection_fill(),
                                     );
                                 }
                                 painter.circle_stroke(
@@ -1588,7 +1581,7 @@ impl DotStrokeApp {
                                     radius,
                                     Stroke::new(
                                         if is_hovered { 2.5 } else { 1.5 },
-                                        Color32::from_rgb(255, 0, 100),
+                                        config::colors::selection_stroke(),
                                     ),
                                 );
                             }
@@ -1598,7 +1591,7 @@ impl DotStrokeApp {
             }
         }
         if self.pixel_preview && self.zoom >= 1.0 {
-            let pixel_grid = Stroke::new(0.5, Color32::from_rgba_unmultiplied(150, 150, 150, 120));
+            let pixel_grid = Stroke::new(0.5, config::colors::pixel_grid_stroke());
             for x in 0..=self.doc.target.width {
                 let sx = canvas_rect.left() + x as f32 * self.zoom;
                 painter.line_segment(
@@ -1642,7 +1635,7 @@ impl DotStrokeApp {
                             painter.circle_filled(
                                 self.doc_to_screen(rect, *point),
                                 radius,
-                                Color32::from_rgba_unmultiplied(255, 0, 100, 70),
+                                config::colors::selection_fill(),
                             );
                         }
                         painter.circle_stroke(
@@ -1650,7 +1643,7 @@ impl DotStrokeApp {
                             radius,
                             Stroke::new(
                                 if is_hovered { 2.5 } else { 1.5 },
-                                Color32::from_rgb(255, 0, 100),
+                                config::colors::selection_stroke(),
                             ),
                         );
                     }
@@ -1666,19 +1659,19 @@ impl DotStrokeApp {
             for pair in pts.windows(2) {
                 painter.line_segment(
                     [pair[0], pair[1]],
-                    Stroke::new(2.0, Color32::from_rgb(255, 0, 100)),
+                    Stroke::new(2.0, config::colors::selection_stroke()),
                 );
             }
         }
         if !self.pending.is_empty() {
-            let guide_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 0, 100, 150));
+            let guide_stroke = Stroke::new(1.0, config::colors::guide_stroke());
             for (index, point) in self.pending.iter().enumerate() {
                 let screen_point = self.doc_to_screen(rect, *point);
                 let radius = if index == 0 { 7.0 } else { 5.0 };
                 painter.circle_filled(
                     screen_point,
                     radius,
-                    Color32::from_rgba_unmultiplied(255, 0, 100, 25),
+                    config::colors::guide_fill(),
                 );
                 painter.circle_stroke(screen_point, radius, guide_stroke);
             }
@@ -1971,7 +1964,6 @@ impl eframe::App for DotStrokeApp {
             if matches!(self.tool.as_str(), "round_rect" | "fill_round_rect") {
                 ui.add(egui::Slider::new(&mut self.radius, 0..=16).text("Corner radius"));
             }
-            ui.checkbox(&mut self.pixel_preview, "Pixel preview");
             egui::ComboBox::from_id_salt("rounding")
                 .selected_text(&self.rounding)
                 .show_ui(ui, |ui| {
@@ -2054,6 +2046,10 @@ impl eframe::App for DotStrokeApp {
                 });
             });
         egui::containers::CentralPanel::default().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.pixel_preview, "Pixel preview");
+            });
+            ui.separator();
             self.draw_canvas(ui);
         });
         if self.new_dialog {
