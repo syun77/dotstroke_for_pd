@@ -1,12 +1,70 @@
 use super::*;
 
 impl DotStrokeApp {
-    pub(super) fn snap(&self, p: Pos2) -> [f32; 2] {
-        match self.rounding.as_str() {
-            "floor" => [p.x.floor(), p.y.floor()],
-            "ceil" => [p.x.ceil(), p.y.ceil()],
-            _ => [p.x.round(), p.y.round()],
+    pub(super) fn has_multiple_selected_objects(&self) -> bool {
+        self.selected_objects.len() > 1
+    }
+
+    pub(super) fn select_single_object(&mut self, object_index: usize) {
+        self.selected = Some((self.current_layer, object_index));
+        self.selected_objects.clear();
+        self.selected_objects.push(object_index);
+        self.selected_point = None;
+    }
+
+    pub(super) fn toggle_object_selection(&mut self, object_index: usize) {
+        if self.selected_objects.is_empty() {
+            if let Some((layer_index, selected_index)) = self.selected {
+                if layer_index == self.current_layer {
+                    self.selected_objects.push(selected_index);
+                }
+            }
         }
+        if let Some(position) = self
+            .selected_objects
+            .iter()
+            .position(|index| *index == object_index)
+        {
+            self.selected_objects.remove(position);
+        } else {
+            self.selected_objects.push(object_index);
+        }
+        self.selected = self
+            .selected_objects
+            .last()
+            .copied()
+            .map(|index| (self.current_layer, index));
+        self.selected_point = None;
+    }
+
+    pub(super) fn select_object_range(&mut self, object_index: usize) {
+        let anchor = self
+            .selected_objects
+            .first()
+            .copied()
+            .or_else(|| self.selected.map(|(_, index)| index));
+        let Some(anchor) = anchor else {
+            self.select_single_object(object_index);
+            return;
+        };
+
+        let start = anchor.min(object_index);
+        let end = anchor.max(object_index);
+        self.selected_objects = (start..=end).collect();
+        self.selected = Some((self.current_layer, object_index));
+        self.selected_point = None;
+    }
+
+    fn snap_value(&self, value: f32) -> f32 {
+        match self.rounding.as_str() {
+            "floor" => value.floor(),
+            "ceil" => value.ceil(),
+            _ => value.round(),
+        }
+    }
+
+    pub(super) fn snap(&self, p: Pos2) -> [f32; 2] {
+        [self.snap_value(p.x), self.snap_value(p.y)]
     }
 
     pub(super) fn screen_to_doc(&self, rect: Rect, p: Pos2) -> Pos2 {
@@ -85,6 +143,9 @@ impl DotStrokeApp {
     }
 
     pub(super) fn hit_test_control_point(&self, rect: Rect, pos: Pos2) -> Option<usize> {
+        if self.has_multiple_selected_objects() {
+            return None;
+        }
         let (layer_index, object_index) = self.selected?;
         let object = self
             .doc
@@ -108,14 +169,20 @@ impl DotStrokeApp {
     }
 
     pub(super) fn move_selected(&mut self, delta: Vec2) {
-        if let Some((layer_index, object_index)) = self.selected {
-            if let Some(object) = self
-                .doc
-                .layers
-                .get_mut(layer_index)
-                .and_then(|l| l.objects.get_mut(object_index))
-            {
-                editor::move_object(object, delta);
+        let layer_index = self.current_layer;
+        let indices = if self.selected_objects.is_empty() {
+            self.selected
+                .filter(|(selected_layer, _)| *selected_layer == layer_index)
+                .map(|(_, index)| vec![index])
+                .unwrap_or_default()
+        } else {
+            self.selected_objects.clone()
+        };
+        if let Some(layer) = self.doc.layers.get_mut(layer_index) {
+            for object_index in indices {
+                if let Some(object) = layer.objects.get_mut(object_index) {
+                    editor::move_object(object, delta);
+                }
             }
         }
     }
@@ -135,6 +202,53 @@ impl DotStrokeApp {
         }
     }
 
+    pub(super) fn snap_selected_geometry_to_grid(&mut self) {
+        let layer_index = self.current_layer;
+        let indices = if self.selected_objects.is_empty() {
+            self.selected
+                .filter(|(selected_layer, _)| *selected_layer == layer_index)
+                .map(|(_, index)| vec![index])
+                .unwrap_or_default()
+        } else {
+            self.selected_objects.clone()
+        };
+        if indices.is_empty() {
+            return;
+        }
+        let single_selection = indices.len() == 1;
+        let selected_point = if single_selection {
+            self.selected_point
+        } else {
+            None
+        };
+        let rounding = self.rounding.as_str();
+        let snap_value = |value: f32| match rounding {
+            "floor" => value.floor(),
+            "ceil" => value.ceil(),
+            _ => value.round(),
+        };
+        let Some(layer) = self.doc.layers.get_mut(layer_index) else {
+            return;
+        };
+
+        for object_index in indices {
+            let Some(object) = layer.objects.get_mut(object_index) else {
+                continue;
+            };
+            if let Some(point_index) = selected_point {
+                if let Some(point) = object.points.get_mut(point_index) {
+                    point[0] = snap_value(point[0]);
+                    point[1] = snap_value(point[1]);
+                }
+            } else {
+                for point in &mut object.points {
+                    point[0] = snap_value(point[0]);
+                    point[1] = snap_value(point[1]);
+                }
+            }
+        }
+    }
+
     pub(super) fn delete_selected(&mut self) {
         if let Some((layer_index, object_index)) = self.selected.take() {
             let can_delete = self
@@ -145,6 +259,7 @@ impl DotStrokeApp {
             if can_delete {
                 self.save_history();
                 self.doc.layers[layer_index].objects.remove(object_index);
+                self.selected_objects.clear();
                 self.selected_point = None;
                 self.status = "Vector deleted".into();
             }
@@ -164,6 +279,7 @@ impl DotStrokeApp {
                 let new_index = object_index + 1;
                 self.doc.layers[layer_index].objects.insert(new_index, copy);
                 self.selected = Some((layer_index, new_index));
+                self.selected_objects = vec![new_index];
                 self.selected_point = None;
                 self.status = "Vector duplicated".into();
             }
@@ -197,6 +313,15 @@ impl DotStrokeApp {
                     selected_index
                 };
                 self.selected = Some((selected_layer, updated_index));
+                for index in &mut self.selected_objects {
+                    if *index == from {
+                        *index = to;
+                    } else if from < to && *index > from && *index <= to {
+                        *index -= 1;
+                    } else if to < from && *index >= to && *index < from {
+                        *index += 1;
+                    }
+                }
             }
         }
         self.status = "Vector order changed".into();

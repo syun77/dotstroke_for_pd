@@ -81,6 +81,7 @@ impl Default for Target {
 pub struct Document {
     pub format: String,
     pub version: i32,
+    pub offset: bool,
     pub target: Target,
     pub canvas: serde_json::Value,
     pub optimize: serde_json::Value,
@@ -92,6 +93,7 @@ impl Default for Document {
         Self {
             format: "pdvector".into(),
             version: 1,
+            offset: false,
             target: Target::default(),
             canvas: serde_json::json!({"background":"white", "ditherAnchor":"screen"}),
             optimize: serde_json::json!({"mergeCollinearLines":true, "removeDuplicatePoints":true, "simplifyTolerance":0}),

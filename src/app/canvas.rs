@@ -121,12 +121,14 @@ impl DotStrokeApp {
                 painter.add(egui::Shape::mesh(mesh));
             }
         } else {
-            for layer in &self.doc.layers {
+            for (layer_index, layer) in self.doc.layers.iter().enumerate() {
                 if layer.visible {
                     for (index, object) in layer.objects.iter().enumerate() {
                         self.draw_object(&painter, rect, object);
-                        if self.selected == Some((self.current_layer, index))
+                        if layer_index == self.current_layer
+                            && self.selected_objects.contains(&index)
                             && !object.points.is_empty()
+                            && !self.has_multiple_selected_objects()
                         {
                             for (point_index, point) in object.points.iter().enumerate() {
                                 let is_dragging_point = response
@@ -184,38 +186,41 @@ impl DotStrokeApp {
             }
         }
         if self.pixel_preview {
-            if let Some((layer_index, object_index)) = self.selected {
-                if let Some(object) = self
-                    .doc
-                    .layers
-                    .get(layer_index)
-                    .and_then(|layer| layer.objects.get(object_index))
-                {
-                    for (point_index, point) in object.points.iter().enumerate() {
-                        let is_dragging_point = response.dragged_by(egui::PointerButton::Primary)
-                            && self.selected_point == Some(point_index);
-                        let is_hovered =
-                            hovered_control_point == Some(point_index) || is_dragging_point;
-                        let radius = if is_hovered {
-                            config::interaction::CONTROL_POINT_HOVER_RADIUS
-                        } else {
-                            config::interaction::CONTROL_POINT_RADIUS
-                        };
-                        if is_hovered {
-                            painter.circle_filled(
+            if !self.has_multiple_selected_objects() {
+                if let Some((layer_index, object_index)) = self.selected {
+                    if let Some(object) = self
+                        .doc
+                        .layers
+                        .get(layer_index)
+                        .and_then(|layer| layer.objects.get(object_index))
+                    {
+                        for (point_index, point) in object.points.iter().enumerate() {
+                            let is_dragging_point = response
+                                .dragged_by(egui::PointerButton::Primary)
+                                && self.selected_point == Some(point_index);
+                            let is_hovered =
+                                hovered_control_point == Some(point_index) || is_dragging_point;
+                            let radius = if is_hovered {
+                                config::interaction::CONTROL_POINT_HOVER_RADIUS
+                            } else {
+                                config::interaction::CONTROL_POINT_RADIUS
+                            };
+                            if is_hovered {
+                                painter.circle_filled(
+                                    self.doc_to_screen(rect, *point),
+                                    radius,
+                                    config::colors::selection_fill(),
+                                );
+                            }
+                            painter.circle_stroke(
                                 self.doc_to_screen(rect, *point),
                                 radius,
-                                config::colors::selection_fill(),
+                                Stroke::new(
+                                    if is_hovered { 2.5 } else { 1.5 },
+                                    config::colors::selection_stroke(),
+                                ),
                             );
                         }
-                        painter.circle_stroke(
-                            self.doc_to_screen(rect, *point),
-                            radius,
-                            Stroke::new(
-                                if is_hovered { 2.5 } else { 1.5 },
-                                config::colors::selection_stroke(),
-                            ),
-                        );
                     }
                 }
             }
@@ -272,30 +277,48 @@ impl DotStrokeApp {
         }
         if self.tool == "select" && !space_down && response.dragged_by(egui::PointerButton::Primary)
         {
-            if self.selected.is_some() {
+            if !self.selected_objects.is_empty() || self.selected.is_some() {
                 if response.drag_started() {
                     // Lock drag target from the initial press position so point drag
                     // consistently moves only that point.
                     let drag_start = ui
                         .input(|input| input.pointer.press_origin())
                         .or_else(|| response.interact_pointer_pos());
-                    self.selected_point =
-                        drag_start.and_then(|position| self.hit_test_control_point(rect, position));
+                    self.selected_point = if self.has_multiple_selected_objects() {
+                        None
+                    } else {
+                        drag_start.and_then(|position| self.hit_test_control_point(rect, position))
+                    };
                     self.save_history();
+                    self.grid_drag_accumulated = Vec2::ZERO;
+                    self.grid_drag_applied = Vec2::ZERO;
+                    self.snap_selected_geometry_to_grid();
                 }
-                let delta = ui.input(|i| i.pointer.delta()) / self.zoom;
+                self.grid_drag_accumulated += ui.input(|i| i.pointer.delta()) / self.zoom;
+                let snapped = self.snap(Pos2::new(
+                    self.grid_drag_accumulated.x,
+                    self.grid_drag_accumulated.y,
+                ));
+                let snapped_delta = Vec2::new(snapped[0], snapped[1]);
+                let delta = snapped_delta - self.grid_drag_applied;
+                self.grid_drag_applied = snapped_delta;
                 if let Some(point_index) = self.selected_point {
                     self.move_selected_point(point_index, delta);
                 } else {
                     self.move_selected(delta);
                 }
+                if response.drag_stopped() {
+                    self.grid_drag_accumulated = Vec2::ZERO;
+                    self.grid_drag_applied = Vec2::ZERO;
+                }
             }
         } else if self.tool == "select" && !space_down && response.clicked() {
-            self.selected = response
+            if let Some(index) = response
                 .interact_pointer_pos()
                 .and_then(|pos| self.hit_test(rect, pos))
-                .map(|index| (self.current_layer, index));
-            self.selected_point = None;
+            {
+                self.select_single_object(index);
+            }
         } else if response.clicked() && !space_down {
             if let Some(pos) = response.interact_pointer_pos() {
                 let p = self.snap(self.screen_to_doc(rect, pos));

@@ -79,14 +79,6 @@ impl eframe::App for DotStrokeApp {
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_dialog = true;
         }
-        let main_focused = ui.input(|input| input.viewport().focused.unwrap_or(false));
-        if main_focused && !self.main_was_focused && self.reference_window {
-            ui.ctx().send_viewport_cmd_to(
-                egui::ViewportId::from_hash_of("reference_preview"),
-                egui::ViewportCommand::Focus,
-            );
-        }
-        self.main_was_focused = main_focused;
         let (undo_pressed, redo_pressed) = ui.input(|input| {
             let modifier = input.modifiers.ctrl || input.modifiers.command;
             (
@@ -167,7 +159,8 @@ impl eframe::App for DotStrokeApp {
             self.export_png();
         }
         if shortcut_copy_playdate_lua {
-            ui.ctx().copy_text(self.playdate_lua(false));
+            ui.ctx()
+                .copy_text(self.playdate_lua(false, self.doc.offset));
             self.status = "Copied Playdate Lua".into();
         }
         egui::Panel::top("menu").show(ui, |ui| {
@@ -216,6 +209,7 @@ impl eframe::App for DotStrokeApp {
                 });
                 if ui.button("Reference Preview").clicked() {
                     self.reference_window = true;
+                    self.reference_focus_requested = true;
                 }
                 ui.menu_button("Resolution", |ui| {
                     ui.label(format!(
@@ -476,12 +470,16 @@ impl eframe::App for DotStrokeApp {
             .show(ui, |ui| {
                 ui.heading("1-bit Preview");
                 self.preview(ui);
-                if ui.button("Copy Playdate Lua").clicked() {
-                    ui.ctx().copy_text(self.playdate_lua(false));
-                    self.status = "Copied Playdate Lua".into();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Copy Playdate Lua").clicked() {
+                        ui.ctx()
+                            .copy_text(self.playdate_lua(false, self.doc.offset));
+                        self.status = "Copied Playdate Lua".into();
+                    }
+                    ui.checkbox(&mut self.doc.offset, "offset");
+                });
                 if ui.button("Copy Anim Lua").clicked() {
-                    ui.ctx().copy_text(self.playdate_lua(true));
+                    ui.ctx().copy_text(self.playdate_lua(true, false));
                     self.status = "Copied Animation Lua".into();
                 }
                 ui.separator();
@@ -508,7 +506,9 @@ impl eframe::App for DotStrokeApp {
                             })
                             .collect();
                         for (index, name, object) in vector_rows {
-                            let is_selected = self.selected == Some((self.current_layer, index));
+                            let is_selected = self.selected_objects.contains(&index);
+                            let (shift_selection, command_selection) =
+                                ui.input(|input| (input.modifiers.shift, input.modifiers.command));
                             let mut clicked = false;
                             let row_response = ui
                                 .horizontal(|ui| {
@@ -580,8 +580,7 @@ impl eframe::App for DotStrokeApp {
                                 || content_drag_response.drag_started()
                             {
                                 self.dragging_vector = Some(index);
-                                self.selected = Some((self.current_layer, index));
-                                self.selected_point = None;
+                                self.select_single_object(index);
                                 self.tool = "select".into();
                             }
                             if handle_drag_response.drag_stopped()
@@ -602,8 +601,13 @@ impl eframe::App for DotStrokeApp {
                                 || handle_drag_response.clicked()
                                 || content_drag_response.clicked()
                             {
-                                self.selected = Some((self.current_layer, index));
-                                self.selected_point = None;
+                                if shift_selection {
+                                    self.select_object_range(index);
+                                } else if command_selection {
+                                    self.toggle_object_selection(index);
+                                } else {
+                                    self.select_single_object(index);
+                                }
                                 self.tool = "select".into();
                             }
                         }
@@ -648,15 +652,18 @@ impl eframe::App for DotStrokeApp {
 
                 ui.separator();
                 ui.heading("Control Points");
-                let selected_points = self
-                    .selected
-                    .and_then(|(layer_index, object_index)| {
-                        self.doc
-                            .layers
-                            .get(layer_index)
-                            .and_then(|layer| layer.objects.get(object_index))
-                    })
-                    .map(|object| object.points.clone());
+                let selected_points = if self.has_multiple_selected_objects() {
+                    None
+                } else {
+                    self.selected
+                        .and_then(|(layer_index, object_index)| {
+                            self.doc
+                                .layers
+                                .get(layer_index)
+                                .and_then(|layer| layer.objects.get(object_index))
+                        })
+                        .map(|object| object.points.clone())
+                };
 
                 let mut point_edits: Vec<(usize, [f32; 2])> = Vec::new();
                 if let Some(points) = selected_points {
@@ -689,7 +696,11 @@ impl eframe::App for DotStrokeApp {
                         }
                     }
                 } else {
-                    ui.label("ベクターを選択してください");
+                    if self.has_multiple_selected_objects() {
+                        ui.label("複数選択中は制御点を表示しません");
+                    } else {
+                        ui.label("ベクターを選択してください");
+                    }
                 }
 
                 if !point_edits.is_empty() {
@@ -896,6 +907,7 @@ impl eframe::App for DotStrokeApp {
                 self.current_file = None;
                 self.pending.clear();
                 self.selected = None;
+                self.selected_objects.clear();
                 self.selected_point = None;
                 self.current_layer = 0;
                 self.new_dialog = false;
@@ -917,6 +929,12 @@ impl eframe::App for DotStrokeApp {
                     self.draw_reference_preview(ui);
                 },
             );
+            if self.reference_focus_requested {
+                ui.ctx()
+                    .send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                self.reference_focus_requested = false;
+            }
         }
+        self.update_window_title(ui.ctx());
     }
 }

@@ -22,7 +22,10 @@ pub(super) struct DotStrokeApp {
     pub(super) last_fitted_target: Option<(i32, i32)>,
     pub(super) pending: Vec<[f32; 2]>,
     pub(super) selected: Option<(usize, usize)>,
+    pub(super) selected_objects: Vec<usize>,
     pub(super) selected_point: Option<usize>,
+    pub(super) grid_drag_accumulated: Vec2,
+    pub(super) grid_drag_applied: Vec2,
     pub(super) dragging_vector: Option<usize>,
     pub(super) current_layer: usize,
     pub(super) status: String,
@@ -47,7 +50,7 @@ pub(super) struct DotStrokeApp {
     pub(super) reference_pan: Vec2,
     pub(super) reference_viewport: Vec2,
     pub(super) reference_last_size: Option<[usize; 2]>,
-    pub(super) main_was_focused: bool,
+    pub(super) reference_focus_requested: bool,
 }
 
 impl Default for DotStrokeApp {
@@ -68,7 +71,10 @@ impl Default for DotStrokeApp {
             last_fitted_target: None,
             pending: vec![],
             selected: None,
+            selected_objects: vec![],
             selected_point: None,
+            grid_drag_accumulated: Vec2::ZERO,
+            grid_drag_applied: Vec2::ZERO,
             dragging_vector: None,
             current_layer: 0,
             status: "Ready".into(),
@@ -93,7 +99,7 @@ impl Default for DotStrokeApp {
             reference_pan: Vec2::ZERO,
             reference_viewport: Vec2::new(640.0, 480.0),
             reference_last_size: None,
-            main_was_focused: false,
+            reference_focus_requested: false,
         }
     }
 }

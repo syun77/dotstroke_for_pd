@@ -135,13 +135,22 @@ impl DotStrokeApp {
         output: &mut String,
         object: &VectorObject,
         dither_active: &mut bool,
+        offset: bool,
     ) {
         if !object.visible || object.points.is_empty() {
             return;
         }
 
+        let coordinate = |value: f32, axis: &str| {
+            let value = Self::lua_number(value);
+            if offset {
+                format!("{}+{}", value, axis)
+            } else {
+                value
+            }
+        };
         let point =
-            |p: &[f32; 2]| format!("{}, {}", Self::lua_number(p[0]), Self::lua_number(p[1]));
+            |p: &[f32; 2]| format!("{}, {}", coordinate(p[0], "ox"), coordinate(p[1], "oy"));
         let points = |points: &[[f32; 2]]| points.iter().map(point).collect::<Vec<_>>().join(", ");
         let _ = writeln!(
             output,
@@ -173,8 +182,8 @@ impl DotStrokeApp {
                     let _ = writeln!(
                         output,
                         "gfx.fillRect({}, {}, {}, {})",
-                        Self::lua_number(x),
-                        Self::lua_number(y),
+                        coordinate(x, "ox"),
+                        coordinate(y, "oy"),
                         Self::lua_number(width),
                         Self::lua_number(height)
                     );
@@ -182,8 +191,8 @@ impl DotStrokeApp {
                     let _ = writeln!(
                         output,
                         "gfx.drawRect({}, {}, {}, {})",
-                        Self::lua_number(x),
-                        Self::lua_number(y),
+                        coordinate(x, "ox"),
+                        coordinate(y, "oy"),
                         Self::lua_number(width),
                         Self::lua_number(height)
                     );
@@ -204,8 +213,8 @@ impl DotStrokeApp {
                     output,
                     "gfx.{}({}, {}, {}, {}, {})",
                     function,
-                    Self::lua_number(x),
-                    Self::lua_number(y),
+                    coordinate(x, "ox"),
+                    coordinate(y, "oy"),
                     Self::lua_number(width),
                     Self::lua_number(height),
                     object.style.radius.max(0)
@@ -256,10 +265,10 @@ impl DotStrokeApp {
                     let _ = writeln!(
                         output,
                         "gfx.drawLine({}, {}, {}, {})",
-                        Self::lua_number(pair[0][0]),
-                        Self::lua_number(pair[0][1]),
-                        Self::lua_number(pair[1][0]),
-                        Self::lua_number(pair[1][1])
+                        coordinate(pair[0][0], "ox"),
+                        coordinate(pair[0][1], "oy"),
+                        coordinate(pair[1][0], "ox"),
+                        coordinate(pair[1][1], "oy")
                     );
                 }
                 if object.closed && object.points.len() > 2 {
@@ -268,10 +277,10 @@ impl DotStrokeApp {
                     let _ = writeln!(
                         output,
                         "gfx.drawLine({}, {}, {}, {})",
-                        Self::lua_number(last[0]),
-                        Self::lua_number(last[1]),
-                        Self::lua_number(first[0]),
-                        Self::lua_number(first[1])
+                        coordinate(last[0], "ox"),
+                        coordinate(last[1], "oy"),
+                        coordinate(first[0], "ox"),
+                        coordinate(first[1], "oy")
                     );
                 }
             }
@@ -279,7 +288,7 @@ impl DotStrokeApp {
         }
 
         for child in &object.children {
-            Self::append_lua_object_simple(output, child, dither_active);
+            Self::append_lua_object_simple(output, child, dither_active, offset);
         }
     }
 
@@ -497,7 +506,7 @@ impl DotStrokeApp {
         output
     }
 
-    pub(super) fn playdate_lua(&self, animation: bool) -> String {
+    pub(super) fn playdate_lua(&self, animation: bool, offset: bool) -> String {
         if animation {
             return self.animation_single_function_lua();
         }
@@ -509,6 +518,9 @@ impl DotStrokeApp {
         } else {
             String::from("local gfx <const> = playdate.graphics\n")
         };
+        if offset && !animation {
+            output.push_str("local ox = 0\nlocal oy = 0\n");
+        }
         if animation {
             let zero_outline_guard = format!(
                 "    if lineWidth <= 0 and kind ~= \"pixel\" then\n        if style.fill then\n            if kind == \"rect\" then\n                gfx.fillRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0)\n            elseif kind == \"round_rect\" then\n                gfx.fillRoundRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0, style.radius or 0)\n            elseif kind == \"ellipse\" then\n                gfx.fillEllipseInRect(params.x or 0, params.y or 0, params.width or 0, params.height or 0)\n            elseif kind == \"polygon\" then\n                gfx.fillPolygon(table.unpack(params.points or {{}}))\n            end\n        end\n        return\n    end\n\n"
@@ -528,7 +540,12 @@ impl DotStrokeApp {
                     if animation {
                         self.append_lua_object_with_animation_function(&mut output, object);
                     } else {
-                        Self::append_lua_object_simple(&mut output, object, &mut dither_active);
+                        Self::append_lua_object_simple(
+                            &mut output,
+                            object,
+                            &mut dither_active,
+                            offset,
+                        );
                     }
                 }
             }

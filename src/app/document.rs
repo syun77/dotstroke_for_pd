@@ -1,6 +1,20 @@
 use super::*;
 
 impl DotStrokeApp {
+    pub(super) fn update_window_title(&self, ctx: &egui::Context) {
+        let file_name = self
+            .current_file
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        let suffix = if self.document_is_dirty() { " *" } else { "" };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "{}{}",
+            file_name, suffix
+        )));
+    }
+
     pub(super) fn save_history(&mut self) {
         self.history.save(&self.doc);
     }
@@ -14,6 +28,7 @@ impl DotStrokeApp {
             self.doc = previous;
             self.pending.clear();
             self.selected = None;
+            self.selected_objects.clear();
             self.selected_point = None;
             self.current_layer = self
                 .current_layer
@@ -27,6 +42,7 @@ impl DotStrokeApp {
             self.doc = next;
             self.pending.clear();
             self.selected = None;
+            self.selected_objects.clear();
             self.selected_point = None;
             self.current_layer = self
                 .current_layer
@@ -69,6 +85,7 @@ impl DotStrokeApp {
                 io::save_recent_files(&self.recent_files);
                 self.pending.clear();
                 self.selected = None;
+                self.selected_objects.clear();
                 self.selected_point = None;
                 self.status = format!("Loaded {}", path.display());
             }
