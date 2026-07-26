@@ -86,6 +86,16 @@ impl eframe::App for DotStrokeApp {
                 modifier && input.key_pressed(egui::Key::Y),
             )
         });
+        let group_pressed = ui.input(|input| {
+            (input.modifiers.ctrl || input.modifiers.command) && input.key_pressed(egui::Key::G)
+        });
+        if group_pressed {
+            self.group_selected_objects();
+        }
+        let rename_folder_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if rename_folder_pressed && self.folder_rename_dialog.is_none() {
+            self.begin_selected_object_rename();
+        }
         if undo_pressed {
             self.undo_document();
         }
@@ -500,7 +510,14 @@ impl eframe::App for DotStrokeApp {
                             .map(|(index, object)| {
                                 (
                                     index,
-                                    format!("{}: {}", index + 1, object.kind),
+                                    format!(
+                                        "{}",
+                                        if object.name.is_empty() {
+                                            object.kind.as_str()
+                                        } else {
+                                            object.name.as_str()
+                                        }
+                                    ),
                                     object.clone(),
                                 )
                             })
@@ -525,8 +542,18 @@ impl eframe::App for DotStrokeApp {
                                         visibility_toggle = Some(index);
                                     }
                                     Self::vector_row_icon(ui, &object, is_selected);
-                                    if ui.selectable_label(is_selected, name).clicked() {
+                                    let name_response = ui.add_sized(
+                                        [
+                                            config::ui::VECTOR_NAME_MIN_WIDTH,
+                                            config::ui::VECTOR_ROW_HEIGHT,
+                                        ],
+                                        egui::Button::selectable(is_selected, name),
+                                    );
+                                    if name_response.clicked() {
                                         clicked = true;
+                                    }
+                                    if name_response.double_clicked() {
+                                        self.begin_object_rename(index);
                                     }
                                     if ui.small_button("↑").on_hover_text("Move up").clicked()
                                         && index > 0
@@ -545,6 +572,10 @@ impl eframe::App for DotStrokeApp {
                             let row_left = row_response.rect.left();
                             let row_top = row_response.rect.top();
                             let row_bottom = row_response.rect.bottom();
+                            if is_selected {
+                                self.folder_rename_dialog_pos =
+                                    Some(row_response.rect.left_bottom());
+                            }
                             let handle_rect = egui::Rect::from_min_max(
                                 egui::pos2(row_left, row_top),
                                 egui::pos2(
@@ -610,6 +641,24 @@ impl eframe::App for DotStrokeApp {
                                 }
                                 self.tool = "select".into();
                             }
+                            if object.kind == "group" {
+                                ui.indent(ui.id().with(("folder_children", index)), |ui| {
+                                    for (child_index, child) in object.children.iter().enumerate() {
+                                        let _ = ui.selectable_label(
+                                            is_selected,
+                                            format!(
+                                                "  {}: {}",
+                                                child_index + 1,
+                                                if child.name.is_empty() {
+                                                    &child.kind
+                                                } else {
+                                                    &child.name
+                                                }
+                                            ),
+                                        );
+                                    }
+                                });
+                            }
                         }
                     });
                 if drag_stopped || ui.input(|input| input.pointer.any_released()) {
@@ -642,6 +691,9 @@ impl eframe::App for DotStrokeApp {
                 }
                 self.paint_vector_drag_preview(ui.ctx());
                 ui.horizontal(|ui| {
+                    if ui.button("Group  ⌘G").clicked() {
+                        self.group_selected_objects();
+                    }
                     if ui.button("Delete").clicked() {
                         self.delete_selected();
                     }
@@ -780,6 +832,83 @@ impl eframe::App for DotStrokeApp {
             ui.separator();
             self.draw_canvas(ui);
         });
+        if let Some(folder_index) = self.folder_rename_dialog {
+            let mut action = None;
+            let object_kind = self
+                .doc
+                .layers
+                .get(self.current_layer)
+                .and_then(|layer| layer.objects.get(folder_index))
+                .map(|object| object.kind.clone())
+                .unwrap_or_else(|| "vector".into());
+            let mut rename_window = egui::Window::new(if object_kind == "group" {
+                "Rename Folder"
+            } else {
+                "Rename Vector"
+            })
+            .collapsible(false)
+            .resizable(false);
+            if let Some(position) = self.folder_rename_dialog_pos {
+                rename_window = rename_window.default_pos(position + egui::vec2(0.0, 8.0));
+            }
+            rename_window.show(ui.ctx(), |ui| {
+                ui.label(if object_kind == "group" {
+                    "Folder name"
+                } else {
+                    "Vector name"
+                });
+                let input_response = ui.add(
+                    egui::TextEdit::singleline(&mut self.folder_rename_input).desired_width(240.0),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked()
+                        || (input_response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                    {
+                        action = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(false);
+                    }
+                });
+            });
+            if let Some(save) = action {
+                if save {
+                    let name = if self.folder_rename_input.trim().is_empty() {
+                        if object_kind == "group" {
+                            "Group".to_string()
+                        } else {
+                            object_kind.clone()
+                        }
+                    } else {
+                        self.folder_rename_input.trim().to_string()
+                    };
+                    let changed = self
+                        .doc
+                        .layers
+                        .get(self.current_layer)
+                        .and_then(|layer| layer.objects.get(folder_index))
+                        .is_some_and(|object| object.name != name);
+                    if changed {
+                        self.save_history();
+                        if let Some(object) = self
+                            .doc
+                            .layers
+                            .get_mut(self.current_layer)
+                            .and_then(|layer| layer.objects.get_mut(folder_index))
+                        {
+                            object.name = name;
+                        }
+                        self.status = if object_kind == "group" {
+                            "Folder renamed".into()
+                        } else {
+                            "Vector renamed".into()
+                        };
+                    }
+                }
+                self.folder_rename_dialog = None;
+            }
+        }
         if self.close_dialog {
             egui::Window::new("Unsaved Changes")
                 .collapsible(false)

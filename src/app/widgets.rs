@@ -221,6 +221,17 @@ impl DotStrokeApp {
             );
         }
 
+        if object.kind == "group" {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "▰",
+                egui::FontId::proportional(14.0),
+                ui.visuals().text_color(),
+            );
+            return;
+        }
+
         if object.points.is_empty() {
             return;
         }

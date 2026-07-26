@@ -34,7 +34,16 @@ impl DotStrokeApp {
         output: &mut String,
         object: &VectorObject,
     ) {
-        if !object.visible || object.points.is_empty() {
+        if !object.visible {
+            return;
+        }
+        if object.kind == "group" {
+            for child in &object.children {
+                self.append_lua_object_with_animation_function(output, child);
+            }
+            return;
+        }
+        if object.points.is_empty() {
             return;
         }
 
@@ -137,7 +146,16 @@ impl DotStrokeApp {
         dither_active: &mut bool,
         offset: bool,
     ) {
-        if !object.visible || object.points.is_empty() {
+        if !object.visible {
+            return;
+        }
+        if object.kind == "group" {
+            for child in &object.children {
+                Self::append_lua_object_simple(output, child, dither_active, offset);
+            }
+            return;
+        }
+        if object.points.is_empty() {
             return;
         }
 
@@ -293,16 +311,20 @@ impl DotStrokeApp {
     }
 
     pub(super) fn last_visible_lua_color(object: &VectorObject) -> Option<&str> {
-        if !object.visible || object.points.is_empty() {
+        if !object.visible {
             return None;
         }
-        let mut color = object.style.color.as_str();
+        let mut color = if object.points.is_empty() {
+            None
+        } else {
+            Some(object.style.color.as_str())
+        };
         for child in &object.children {
             if let Some(child_color) = Self::last_visible_lua_color(child) {
-                color = child_color;
+                color = Some(child_color);
             }
         }
-        Some(color)
+        color
     }
 
     #[allow(dead_code)]
@@ -374,7 +396,16 @@ impl DotStrokeApp {
         output: &mut String,
         object: &VectorObject,
     ) {
-        if !object.visible || object.points.is_empty() {
+        if !object.visible {
+            return;
+        }
+        if object.kind == "group" {
+            for child in &object.children {
+                self.append_animation_object_inline(output, child);
+            }
+            return;
+        }
+        if object.points.is_empty() {
             return;
         }
 

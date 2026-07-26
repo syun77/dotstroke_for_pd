@@ -1,6 +1,124 @@
 use super::*;
 
 impl DotStrokeApp {
+    pub(super) fn begin_object_rename(&mut self, index: usize) {
+        let Some(object) = self
+            .doc
+            .layers
+            .get(self.current_layer)
+            .and_then(|layer| layer.objects.get(index))
+        else {
+            return;
+        };
+        self.folder_rename_input = if object.name.is_empty() {
+            if object.kind == "group" {
+                "Group".into()
+            } else {
+                object.kind.clone()
+            }
+        } else {
+            object.name.clone()
+        };
+        self.folder_rename_dialog = Some(index);
+    }
+
+    pub(super) fn begin_selected_object_rename(&mut self) {
+        if self.selected_objects.len() != 1 {
+            return;
+        }
+        let index = self.selected_objects[0];
+        self.begin_object_rename(index);
+    }
+
+    pub(super) fn group_selected_objects(&mut self) {
+        let layer_index = self.current_layer;
+        if self.selected_objects.len() == 1 {
+            let selected_index = self.selected_objects[0];
+            let is_group = self
+                .doc
+                .layers
+                .get(layer_index)
+                .and_then(|layer| layer.objects.get(selected_index))
+                .is_some_and(|object| object.kind == "group");
+            if is_group {
+                self.ungroup_selected_folder(selected_index);
+                return;
+            }
+        }
+        let mut indices: Vec<usize> = if self.selected_objects.is_empty() {
+            self.selected
+                .filter(|(layer, _)| *layer == layer_index)
+                .map(|(_, index)| vec![index])
+                .unwrap_or_default()
+        } else {
+            self.selected_objects.clone()
+        };
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.len() < 2 {
+            self.status = "Select at least two vectors to group".into();
+            return;
+        }
+        let can_group = self.doc.layers.get(layer_index).is_some_and(|layer| {
+            !indices
+                .iter()
+                .any(|index| layer.objects.get(*index).is_some_and(|o| o.kind == "group"))
+        });
+        if !can_group {
+            self.status = "Folders cannot be nested".into();
+            return;
+        }
+        self.save_history();
+        let Some(layer) = self.doc.layers.get_mut(layer_index) else {
+            return;
+        };
+        let mut children = Vec::with_capacity(indices.len());
+        for index in indices.iter().rev() {
+            children.push(layer.objects.remove(*index));
+        }
+        children.reverse();
+        let insert_at = indices[0];
+        layer.objects.insert(
+            insert_at,
+            VectorObject {
+                kind: "group".into(),
+                name: "Group".into(),
+                children,
+                visible: true,
+                ..Default::default()
+            },
+        );
+        self.selected = Some((layer_index, insert_at));
+        self.selected_objects = vec![insert_at];
+        self.selected_point = None;
+        self.status = "Vectors grouped".into();
+    }
+
+    fn ungroup_selected_folder(&mut self, folder_index: usize) {
+        let layer_index = self.current_layer;
+        let Some(layer) = self.doc.layers.get(layer_index) else {
+            return;
+        };
+        if folder_index >= layer.objects.len() || layer.objects[folder_index].kind != "group" {
+            return;
+        }
+        self.save_history();
+        let layer = &mut self.doc.layers[layer_index];
+        let folder = layer.objects.remove(folder_index);
+        let child_count = folder.children.len();
+        for (offset, child) in folder.children.into_iter().enumerate() {
+            layer.objects.insert(folder_index + offset, child);
+        }
+        self.selected_objects = (folder_index..folder_index + child_count).collect();
+        self.selected = self
+            .selected_objects
+            .last()
+            .copied()
+            .map(|index| (layer_index, index));
+        self.selected_point = None;
+        self.status = "Folder ungrouped".into();
+    }
+
     pub(super) fn has_multiple_selected_objects(&self) -> bool {
         self.selected_objects.len() > 1
     }
@@ -111,29 +229,24 @@ impl DotStrokeApp {
             .enumerate()
             .rev()
             .find_map(|(index, object)| {
-                if !object.visible || object.points.is_empty() {
+                if !object.visible {
                     return None;
                 }
-                let min_x = object
-                    .points
-                    .iter()
-                    .map(|p| p[0])
-                    .fold(f32::INFINITY, f32::min)
-                    - tolerance;
-                let max_x = object
-                    .points
+                let mut points = object.points.iter().copied().collect::<Vec<_>>();
+                for child in &object.children {
+                    points.extend(child.points.iter().copied());
+                }
+                if points.is_empty() {
+                    return None;
+                }
+                let min_x = points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min) - tolerance;
+                let max_x = points
                     .iter()
                     .map(|p| p[0])
                     .fold(f32::NEG_INFINITY, f32::max)
                     + tolerance;
-                let min_y = object
-                    .points
-                    .iter()
-                    .map(|p| p[1])
-                    .fold(f32::INFINITY, f32::min)
-                    - tolerance;
-                let max_y = object
-                    .points
+                let min_y = points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min) - tolerance;
+                let max_y = points
                     .iter()
                     .map(|p| p[1])
                     .fold(f32::NEG_INFINITY, f32::max)

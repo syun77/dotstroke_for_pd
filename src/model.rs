@@ -34,6 +34,7 @@ impl Default for Style {
 pub struct VectorObject {
     #[serde(rename = "type")]
     pub kind: String,
+    pub name: String,
     pub points: Vec<[f32; 2]>,
     pub closed: bool,
     pub style: Style,

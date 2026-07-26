@@ -13,7 +13,16 @@ impl DotStrokeApp {
         zoom: f32,
         pan: Vec2,
     ) {
-        if !object.visible || object.points.is_empty() {
+        if !object.visible {
+            return;
+        }
+        if object.kind == "group" {
+            for child in &object.children {
+                self.draw_object_at(painter, rect, child, zoom, pan);
+            }
+            return;
+        }
+        if object.points.is_empty() {
             return;
         }
         let pts: Vec<Pos2> = object
@@ -34,63 +43,66 @@ impl DotStrokeApp {
         let stroke = Stroke::new((object.style.width.max(1) as f32) * zoom, color);
         if object.style.dither_pattern != "none" {
             self.draw_object_dithered_at(painter, rect, object, &pts, stroke, color, zoom, pan);
-            return;
-        }
-        match object.kind.as_str() {
-            "pixel" => {
-                painter.circle_filled(
-                    pts[0],
-                    (object.style.width.max(1) as f32 * zoom).max(1.0),
-                    color,
-                );
-            }
-            "rect" if pts.len() >= 2 => {
-                let r = Rect::from_two_pos(pts[0], pts[1]);
-                if object.style.fill {
-                    painter.rect_filled(r, 0.0, color);
-                } else {
-                    painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Middle);
+        } else {
+            match object.kind.as_str() {
+                "pixel" => {
+                    painter.circle_filled(
+                        pts[0],
+                        (object.style.width.max(1) as f32 * zoom).max(1.0),
+                        color,
+                    );
                 }
-            }
-            "round_rect" if pts.len() >= 2 => {
-                let r = Rect::from_two_pos(pts[0], pts[1]);
-                let radius = object.style.radius.max(0) as f32 * zoom;
-                if object.style.fill {
-                    painter.rect_filled(r, radius, color);
-                } else {
-                    painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Middle);
+                "rect" if pts.len() >= 2 => {
+                    let r = Rect::from_two_pos(pts[0], pts[1]);
+                    if object.style.fill {
+                        painter.rect_filled(r, 0.0, color);
+                    } else {
+                        painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Middle);
+                    }
                 }
-            }
-            "ellipse" if pts.len() >= 2 => {
-                let r = Rect::from_two_pos(pts[0], pts[1]);
-                if object.style.fill {
-                    painter.add(egui::Shape::ellipse_filled(
+                "round_rect" if pts.len() >= 2 => {
+                    let r = Rect::from_two_pos(pts[0], pts[1]);
+                    let radius = object.style.radius.max(0) as f32 * zoom;
+                    if object.style.fill {
+                        painter.rect_filled(r, radius, color);
+                    } else {
+                        painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Middle);
+                    }
+                }
+                "ellipse" if pts.len() >= 2 => {
+                    let r = Rect::from_two_pos(pts[0], pts[1]);
+                    if object.style.fill {
+                        painter.add(egui::Shape::ellipse_filled(
+                            r.center(),
+                            Vec2::new(r.width() / 2.0, r.height() / 2.0),
+                            color,
+                        ));
+                    }
+                    painter.add(egui::Shape::ellipse_stroke(
                         r.center(),
                         Vec2::new(r.width() / 2.0, r.height() / 2.0),
-                        color,
+                        stroke,
                     ));
                 }
-                painter.add(egui::Shape::ellipse_stroke(
-                    r.center(),
-                    Vec2::new(r.width() / 2.0, r.height() / 2.0),
-                    stroke,
-                ));
-            }
-            "polygon" if pts.len() >= 3 => {
-                if object.style.fill {
-                    painter.add(egui::Shape::convex_polygon(pts.clone(), color, stroke));
-                } else {
-                    painter.add(egui::Shape::closed_line(pts.clone(), stroke));
+                "polygon" if pts.len() >= 3 => {
+                    if object.style.fill {
+                        painter.add(egui::Shape::convex_polygon(pts.clone(), color, stroke));
+                    } else {
+                        painter.add(egui::Shape::closed_line(pts.clone(), stroke));
+                    }
+                }
+                _ => {
+                    for pair in pts.windows(2) {
+                        painter.line_segment([pair[0], pair[1]], stroke);
+                    }
+                    if object.closed && pts.len() > 2 {
+                        painter.line_segment([*pts.last().unwrap(), pts[0]], stroke);
+                    }
                 }
             }
-            _ => {
-                for pair in pts.windows(2) {
-                    painter.line_segment([pair[0], pair[1]], stroke);
-                }
-                if object.closed && pts.len() > 2 {
-                    painter.line_segment([*pts.last().unwrap(), pts[0]], stroke);
-                }
-            }
+        }
+        for child in &object.children {
+            self.draw_object_at(painter, rect, child, zoom, pan);
         }
     }
 

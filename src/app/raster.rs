@@ -227,7 +227,16 @@ impl DotStrokeApp {
         object: &VectorObject,
         transparent_background: bool,
     ) {
-        if !object.visible || object.points.is_empty() {
+        if !object.visible {
+            return;
+        }
+        if object.kind == "group" {
+            for child in &object.children {
+                self.rasterize_object(pixels, width, height, child, transparent_background);
+            }
+            return;
+        }
+        if object.points.is_empty() {
             return;
         }
         let color = match object.style.color.as_str() {

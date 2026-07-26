@@ -51,6 +51,9 @@ pub(super) struct DotStrokeApp {
     pub(super) reference_viewport: Vec2,
     pub(super) reference_last_size: Option<[usize; 2]>,
     pub(super) reference_focus_requested: bool,
+    pub(super) folder_rename_dialog: Option<usize>,
+    pub(super) folder_rename_input: String,
+    pub(super) folder_rename_dialog_pos: Option<Pos2>,
 }
 
 impl Default for DotStrokeApp {
@@ -100,6 +103,9 @@ impl Default for DotStrokeApp {
             reference_viewport: Vec2::new(640.0, 480.0),
             reference_last_size: None,
             reference_focus_requested: false,
+            folder_rename_dialog: None,
+            folder_rename_input: String::new(),
+            folder_rename_dialog_pos: None,
         }
     }
 }

@@ -67,4 +67,7 @@ pub fn move_object(object: &mut VectorObject, delta: Vec2) {
         point[0] += delta.x;
         point[1] += delta.y;
     }
+    for child in &mut object.children {
+        move_object(child, delta);
+    }
 }
